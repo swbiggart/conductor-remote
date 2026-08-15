@@ -26,7 +26,7 @@
  *
  * Stdlib + global fetch only — no runtime deps, no transform-requiring syntax (keeps the relay strip-clean).
  */
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -139,7 +139,39 @@ function isNewer(candidate: string, base: string): boolean {
  */
 function installedVersion(): string {
 	const onDisk = diskVersion()
-	return onDisk && isNewer(onDisk, CURRENT) ? onDisk : CURRENT
+	const best = onDisk && isNewer(onDisk, CURRENT) ? onDisk : CURRENT
+	// Source checkouts carry semantic-release's `0.0.0-development` placeholder, which makes every
+	// published release read as an update — permanently. Their real base is the nearest reachable tag.
+	if (parseVersion(best)?.every(n => n === 0)) return gitBaseVersion() ?? best
+	return best
+}
+
+/**
+ * The version a source checkout is actually based on: its nearest reachable git tag. package.json in a
+ * checkout holds the placeholder (see installedVersion()), so without this the update indicator can
+ * never turn off for anyone running from source. Cached for the process lifetime — the base only moves
+ * via a checkout/rebase, and a redeploy restarts the daemon anyway. Null when git/tags are unavailable,
+ * so the caller falls back to the placeholder (today's behavior).
+ */
+let gitBase: string | null | undefined
+function gitBaseVersion(): string | null {
+	if (gitBase !== undefined) return gitBase
+	gitBase = null
+	if (fs.existsSync(path.join(projectDir, '.git'))) {
+		try {
+			const out = execFileSync('git', ['describe', '--tags', '--abbrev=0'], {
+				cwd: projectDir,
+				encoding: 'utf8',
+				timeout: 2000,
+				stdio: ['ignore', 'pipe', 'ignore']
+			})
+			const version = out.trim().replace(/^v/, '')
+			if (parseVersion(version)) gitBase = version
+		} catch {
+			// not a git checkout, or no tags fetched — the placeholder fallback stands
+		}
+	}
+	return gitBase
 }
 
 async function fetchLatest(): Promise<string | null> {
