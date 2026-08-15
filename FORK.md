@@ -28,8 +28,14 @@ daemon can never install code on its own (`resolveMode()` in `src/autoupdate.ts`
 ## Ops
 
 From this directory: `yarn service status|restart|uninstall`, `node bin/cli.js logs`.
-The LaunchAgent plist bakes the absolute node path — after replacing the nvm node
-version, re-run `AUTO_UPDATE=check yarn deploy`.
+
+The service runs under a **dedicated copy of the node binary** at
+`~/Library/Application Support/conductor-remote/bin/node`, so the Accessibility grant
+covers only this daemon — never the shared nvm node that runs everything else.
+To update node deliberately: copy the new binary over that path, then re-run
+`cd ~/Code/conductor-remote && AUTO_UPDATE=check "$HOME/Library/Application Support/conductor-remote/bin/node" bin/cli.js service install`
+and re-grant Accessibility (the grant is pinned to the binary's code hash).
+Plain `yarn deploy` would re-bake the PATH node into the plist — use the command above instead.
 
 Upstream PR plan: cherry-pick the two feature commits (without this file) onto a branch
 cut from `main`.
