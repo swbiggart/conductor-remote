@@ -23,11 +23,15 @@ export function ConnectSheet({
 }) {
 	const token = useApp(s => s.token)
 	const setToken = useApp(s => s.setToken)
+	const update = useApp(s => s.update)
 	const [copied, setCopied] = useState(false)
 	const url = token ? `${location.origin}/#token=${token}` : location.origin
 	// Relay is ahead of the build this app booted → a service-worker update is pending
 	// (ReloadPrompt will surface it). Flag it here so the versions explain a stale UI.
 	const stale = !!version && version !== __APP_VERSION__
+	// A newer release is on npm and the relay is in check (notify-only) mode: the passive counterpart
+	// of auto mode's OfflineBanner strip. Updating stays a deliberate act on the Mac, so this only informs.
+	const newRelease = update?.mode === 'check' && update.available && update.latest ? update.latest : null
 
 	const copy = async () => {
 		try {
@@ -98,6 +102,7 @@ export function ConnectSheet({
 						{' · '}
 						<span className={stale ? 'text-working' : undefined}>app v{__APP_VERSION__}</span>
 						{stale ? ' · update pending' : ''}
+						{newRelease ? <span className="text-working">{` · v${newRelease} available`}</span> : null}
 					</span>
 					<button type="button" onClick={onLogs} className="shrink-0 text-muted underline-offset-2 hover:underline">
 						Logs

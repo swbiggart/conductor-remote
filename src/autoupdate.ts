@@ -294,6 +294,16 @@ async function runCheck(mode: 'check' | 'auto'): Promise<void> {
 	}
 }
 
+/**
+ * One immediate registry check on demand (POST /api/update/check) — the periodic cadence is right for a
+ * daemon but useless when a human is watching. Returns the fresh snapshot; `inFlight` already makes a
+ * call that races the timer safe. When the updater is off there is nothing to check — snapshot as-is.
+ */
+export async function checkNow(): Promise<UpdateStatus> {
+	if (status.mode === 'check' || status.mode === 'auto') await runCheck(status.mode)
+	return updateStatus()
+}
+
 /** Start the periodic self-updater. Safe to call unconditionally — it no-ops unless the gates pass. */
 export function startAutoUpdate(): void {
 	const mode = resolveMode()

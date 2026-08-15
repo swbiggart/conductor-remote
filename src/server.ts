@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import zlib from 'node:zlib'
-import { startAutoUpdate, updateStatus } from './autoupdate.ts'
+import { checkNow, startAutoUpdate, updateStatus } from './autoupdate.ts'
 import { loadConfig, stateDir } from './config.ts'
 import { ConductorDb } from './db.ts'
 import { FirstPromptQueue } from './firstprompt.ts'
@@ -541,6 +541,13 @@ const server = http.createServer(async (req, res) => {
 				ts: Date.now()
 			})
 			return json(req, res, result.ok ? 200 : 502, result)
+		}
+
+		// POST /api/update/check — one registry check now, instead of waiting out the poll interval.
+		// 409 when the updater is off: there is no check to run, and off means *off*.
+		if (req.method === 'POST' && pathname === '/api/update/check') {
+			if (updateStatus().mode === 'off') return json(req, res, 409, { error: 'auto-update is off' })
+			return json(req, res, 200, await checkNow())
 		}
 
 		// POST /api/workspaces { repo, prompt, send? } — create a workspace via Conductor's deep link
