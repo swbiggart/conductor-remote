@@ -206,6 +206,14 @@ export interface TranscriptEntry {
 	plan?: string
 	ts: string
 	queued: boolean
+	/** Files the user attached on the Mac — rendered as chips under the bubble. */
+	attachments?: { name: string; path: string }[]
+	/** Conductor's turn id — groups a turn's entries for the end-of-turn summary. */
+	turnId?: string
+	/** Line counts for a file-editing tool call, plus the clipped hunk behind the chip. */
+	adds?: number
+	dels?: number
+	hunk?: string
 }
 
 export interface QuestionOption {

@@ -400,6 +400,17 @@ const parkedPrompts = new ParkedPromptQueue(path.join(stateDir(), 'parked-prompt
 	}
 })
 
+/** What the transcript file endpoint will serve — images only, no scriptable types (svg). */
+const IMAGE_MIME: Record<string, string> = {
+	'.png': 'image/png',
+	'.jpg': 'image/jpeg',
+	'.jpeg': 'image/jpeg',
+	'.gif': 'image/gif',
+	'.webp': 'image/webp',
+	'.heic': 'image/heic'
+}
+const MAX_SERVED_FILE_BYTES = 20 * 1024 * 1024
+
 const MIME: Record<string, string> = {
 	'.html': 'text/html; charset=utf-8',
 	'.js': 'text/javascript; charset=utf-8',
@@ -762,6 +773,36 @@ const server = http.createServer(async (req, res) => {
 				...reads.getMessages(sessionId, Number.isFinite(after) ? after : 0),
 				pending: reads.pendingInput(sessionId)
 			})
+		}
+
+		// GET /api/sessions/:id/file?path=… — serve an image the transcript references
+		// (a Read-step screenshot, a user attachment). **The transcript is the ACL**:
+		// the exact path string must appear in this session's entries (a tool row's
+		// detail or an attachment ref), which both scopes what the token can reach and
+		// kills traversal — no path the agent never touched is servable. Images only,
+		// size-capped; relative paths resolve against the session's worktree, the same
+		// base the transcript's relative paths already mean.
+		m = pathname.match(/^\/api\/sessions\/([^/]+)\/file$/)
+		if (req.method === 'GET' && m) {
+			const sessionId = decodeURIComponent(m[1])
+			const filePath = url.searchParams.get('path') ?? ''
+			const mime = IMAGE_MIME[path.extname(filePath).toLowerCase()]
+			if (!mime) return json(req, res, 400, { error: 'only image files are served' })
+			const { entries } = reads.getMessages(sessionId)
+			const referenced = entries.some(e => e.detail === filePath || e.attachments?.some(a => a.path === filePath))
+			if (!referenced) return json(req, res, 404, { error: 'file not referenced in this chat' })
+			const worktree = reads.worktreeFor(sessionId)
+			const abs = path.isAbsolute(filePath) ? filePath : worktree ? path.join(worktree, filePath) : null
+			if (!abs) return json(req, res, 404, { error: 'no worktree to resolve the path against' })
+			try {
+				const stat = await fs.promises.stat(abs)
+				if (stat.size > MAX_SERVED_FILE_BYTES) return json(req, res, 413, { error: 'file too large' })
+				const body = await fs.promises.readFile(abs)
+				res.writeHead(200, { 'content-type': mime, 'cache-control': 'private, max-age=3600' })
+				return res.end(body)
+			} catch {
+				return json(req, res, 404, { error: 'file not found on disk' })
+			}
 		}
 
 		// GET /api/sessions/:id/models?workspaceId=[&refresh=1] — the models this chat's

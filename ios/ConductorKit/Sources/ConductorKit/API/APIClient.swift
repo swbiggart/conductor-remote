@@ -70,6 +70,17 @@ public actor APIClient {
 		try await get("/api/workspaces/\(escape(workspaceID))/sessions", tier: .poll)
 	}
 
+	/// Raw bytes of a transcript-referenced image (the relay only serves paths
+	/// this chat's entries actually name). Bytes rather than a URL because the
+	/// auth rides a header AsyncImage can't send.
+	public func fileData(sessionID: String, path filePath: String) async throws -> Data {
+		let escaped = filePath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? filePath
+		let (data, http) = try await perform(
+			try request(path: "/api/sessions/\(escape(sessionID))/file?path=\(escaped)", tier: .action, revalidate: false))
+		guard http.statusCode == 200 else { throw serverError(data: data, status: http.statusCode) }
+		return data
+	}
+
 	public func messages(sessionID: String, after cursor: Int64) async throws -> MessagesResponse? {
 		// A cursor-0 fetch is a transcript that holds *nothing* — there is no
 		// state a 304 could tell it to keep, so it must never be conditional.

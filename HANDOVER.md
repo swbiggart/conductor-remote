@@ -65,77 +65,30 @@ bakes the absolute `node` path, so re-run `yarn deploy` after an nvm upgrade.
 
 ## Open work, in priority order
 
-1. **Mac-style edit chips + turn summaries in the transcript** (assessed
-   2026-08-15 against the raw rows; the data is all present, only plumbing and
-   rendering are missing):
-   - *Relay (one change, both clients benefit):* tool entries for Edit/Write
-     gain `adds`/`dels` counted from the tool input's `old_string`/`new_string`
-     during the existing `transcript.ts` parse, plus a **clipped** unified hunk
-     computed from the same strings (never ship the raw strings — the 1s
-     `/messages` poll must stay small); add `turn_id` to `reads.getMessages`'s
-     SELECT (the column already exists). All additive — stale clients ignore.
-   - *Clients:* file chips with `+N −M` on edit steps, tap-to-expand hunk
-     rendered mono with green/red line gutters (the Mac's look minus token
-     colors); end-of-turn summary row — duration from the turn head's `sent_at`
-     to the last row's `ts` (same computation as the error capsule's), per-file
-     totals as a client-side group-by over `turn_id`.
-   - *Polish, separately:* real syntax highlighting (a Swift highlighter
-     package on iOS; shiki/hljs bundle weight on the PWA — neither client has
-     one today), and attachment thumbnails: `transcript.ts` already parses
-     Conductor's `@⟦name⟧(path)` markup into `entry.attachments`
-     (worktree-relative paths under `.context/attachments/`), so what's left is
-     one read-only, path-traversal-guarded relay endpoint that serves those
-     files plus image chips in the clients.
-2. **Live steps stream individually; fold only when the turn ends** (matching
-   the Mac app). Today both clients fold agent steps into an "N steps"
-   disclosure as they arrive; while the agent is *working* each step should
-   render as its own row (the newest visibly appending), and the run should
-   collapse into the group only once the session goes idle. Touches the fold
-   in `ios/ConductorKit … TranscriptGrouping` and the PWA's step-group fold
-   (`web/src/components/Transcript.tsx`); the working/idle signal is already
-   on the session row both clients poll. Mind the documented invariant that
-   group identity stays stable (first row's key) so expansion state survives
-   the collapse.
-3. **Image-file steps render as image chips** (matching the Mac app). A step
-   like `Read /tmp/spark-fixed.png` currently shows the raw path twice; the
-   Mac shows "Read image" plus a chip with an image glyph and just the file
-   *name*. For steps whose `detail` is an image path (by extension): relabel,
-   trim to basename, chip styling — all client-side and free. Tapping the
-   chip should show the *image*, not the path, which needs the same guarded
-   relay file-serving endpoint as item 1's attachment thumbnails — but note
-   the policy difference: attachment refs are worktree-relative and safe to
-   serve, while tool paths can point anywhere on disk (`/tmp/…`), so gate
-   serving on image extensions and on the path having actually appeared in
-   that session's transcript, and still refuse traversal.
-4. **Attachment markers in user bubbles render as real chips.** The relay
-   already parses Conductor's `@⟦name⟧(path)` markup out of user prompts into
-   `entry.attachments` and leaves a `📎 name` text marker — which the iOS
-   bubble renders as a tofu "?" glyph. Clients that see `entry.attachments`
-   should strip the marker from the text entirely and render a proper chip
-   (rounded border, image/doc glyph by extension, name only — same chip
-   treatment as item 3, and tapping opens the file via the same guarded
-   endpoint; these are worktree-relative and safe). Relay side: swap the
-   marker for plain `(name)` so stale clients get clean text with no emoji
-   dependency.
-5. **No seconds in the prompt navigator's timestamps.** The "your prompts"
-   jump sheet shows two-unit relative times with live-ticking seconds
-   ("51 min, 17 sec"); it should show one coarse unit ("51m ago") — seconds
-   are noise at that altitude and the ticking redraws the sheet every second.
-   iOS `MessageNavigator` formatter (drop to one unit, no seconds); check the
-   PWA's equivalent sheet for the same.
-6. **Sidecar** — superseded by the 0.81 re-derivation: the socket is
+1. **Sidecar** — superseded by the 0.81 re-derivation: the socket is
    single-client (connecting steals the app's event tunnel), so it must not
    become the default. Current state and the gated locked-Mac experiment live
    in CLAUDE.md ▸ writes ▸ `sidecar` and `scripts/sidecar-probe.ts`.
-7. **Visual QA on a real phone.** The build + all endpoints are verified, but the
+2. **Visual QA on a real phone.** The build + all endpoints are verified, but the
    UI hasn't been screenshotted on-device (browser automation needs an
    interactive Chrome connect this session couldn't do). Check the list, session
    tabs (Chat/Diff), composer, and install/standalone appearance.
-8. **SSE push** instead of ~2s polling (optional; polling is fine over a
+3. **SSE push** instead of ~2s polling (optional; polling is fine over a
    LAN/tailnet and simpler).
-9. **Session picker.** The API returns all sessions per workspace
-   (`/api/workspaces/:id/sessions`); the PWA opens the active one. Add a picker
-   for history/side sessions.
+4. **Transcript polish, remaining tier:** real syntax highlighting in the
+   step hunks and the diff views (a Swift highlighter package on iOS;
+   shiki/hljs bundle weight on the PWA — neither client has one today).
+
+Done 2026-08-15 (the transcript-polish queue): per-edit `+N −M` chips with
+tap-to-expand clipped hunks and end-of-turn summaries (duration + per-file
+totals over `turn_id`), live steps streaming individually until the turn ends,
+image steps and user attachments as chips that open the file through
+`GET /api/sessions/:id/file` (transcript-gated, images only), and coarse
+single-unit timestamps in the prompt navigator. Relay: `transcript.ts`
+(`editDiff`/`diffStrings`, `turnId`), `server.ts` (file endpoint); clients:
+`Transcript.tsx` / `Grouping.swift` + `TranscriptView.swift` (fold tests cover
+the live-unfold and summary rules). The PWA has had chat tabs since the session
+picker item was written, so that item is retired.
 
 ## File map
 

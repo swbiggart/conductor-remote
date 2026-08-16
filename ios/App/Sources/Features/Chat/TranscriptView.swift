@@ -75,7 +75,7 @@ struct TranscriptView: View {
 		case .message(let entry):
 			switch entry.role {
 			case .user:
-				UserBubble(entry: entry)
+				UserBubble(entry: entry, sessionID: session.id)
 					.id(entry.key)
 			case .assistant:
 				AssistantProse(text: entry.text)
@@ -95,9 +95,11 @@ struct TranscriptView: View {
 				EmptyView()
 			}
 		case .step(let entry):
-			StepRow(entry: entry)
+			StepRow(entry: entry, sessionID: session.id)
 		case .steps(let group):
-			StepGroupView(group: group)
+			StepGroupView(group: group, sessionID: session.id)
+		case .turnSummary(let summary):
+			TurnSummaryRow(summary: summary)
 		}
 	}
 
@@ -146,10 +148,36 @@ struct ErrorNotice: View {
 
 struct UserBubble: View {
 	let entry: TranscriptEntry
+	let sessionID: String
 
 	var body: some View {
 		VStack(alignment: .trailing, spacing: 3) {
-			MarkdownText(entry.text)
+			VStack(alignment: .leading, spacing: 8) {
+				MarkdownText(entry.text)
+				if let attachments = entry.attachments, !attachments.isEmpty {
+					// The Mac's attachment chips: image ones open the file itself
+					// through the relay's transcript-gated endpoint.
+					HStack(spacing: 6) {
+						ForEach(attachments) { attachment in
+							if isImagePath(attachment.path) {
+								ImageChipView(sessionID: sessionID, path: attachment.path, name: attachment.name)
+							} else {
+								HStack(spacing: 5) {
+									Image(systemName: "doc")
+										.font(.caption2)
+										.foregroundStyle(.secondary)
+									Text(attachment.name)
+										.font(.caption.monospaced())
+										.lineLimit(1)
+								}
+								.padding(.horizontal, 8)
+								.padding(.vertical, 3)
+								.background(Color.surfaceRaised, in: RoundedRectangle(cornerRadius: 7))
+							}
+						}
+					}
+				}
+			}
 				.padding(.horizontal, 14)
 				.padding(.vertical, 9)
 				.background(Color.accentSoft, in: UnevenRoundedRectangle(
@@ -189,9 +217,26 @@ struct AssistantProse: View {
 	}
 }
 
+/// True for the image extensions the relay's file endpoint will serve.
+func isImagePath(_ path: String) -> Bool {
+	["png", "jpg", "jpeg", "gif", "webp", "heic"].contains((path as NSString).pathExtension.lowercased())
+}
+
+func fileBasename(_ path: String) -> String {
+	(path as NSString).lastPathComponent
+}
+
 struct StepRow: View {
 	let entry: TranscriptEntry
+	let sessionID: String
 	@State private var expanded = false
+
+	/// A file-editing step — its row carries the +N −M chip and expands to the hunk.
+	private var isEdit: Bool { entry.adds != nil || entry.dels != nil }
+	private var imagePath: String? {
+		guard let detail = entry.detail, isImagePath(detail) else { return nil }
+		return detail
+	}
 
 	var body: some View {
 		VStack(alignment: .leading, spacing: 3) {
@@ -202,11 +247,24 @@ struct StepRow: View {
 					Image(systemName: entry.role == .thinking ? "brain" : toolSymbol(entry.tool))
 						.font(.caption)
 						.foregroundStyle(entry.isError ? Color.diffDelete : .secondary)
-					Text(entry.role == .thinking ? "Thinking" : entry.text)
+					Text(label)
 						.font(.footnote)
 						.foregroundStyle(.secondary)
 						.lineLimit(1)
-					if let detail = entry.detail {
+					if let imagePath {
+						ImageChipView(sessionID: sessionID, path: imagePath, name: fileBasename(imagePath))
+					} else if isEdit, let detail = entry.detail {
+						Text(fileBasename(detail))
+							.font(.caption.monospaced())
+							.foregroundStyle(.tertiary)
+							.lineLimit(1)
+						if let adds = entry.adds, adds > 0 {
+							Text("+\(adds)").font(.caption.monospacedDigit()).foregroundStyle(Color.diffAdd)
+						}
+						if let dels = entry.dels, dels > 0 {
+							Text("−\(dels)").font(.caption.monospacedDigit()).foregroundStyle(Color.diffDelete)
+						}
+					} else if let detail = entry.detail {
 						Text(detail)
 							.font(.caption.monospaced())
 							.foregroundStyle(.tertiary)
@@ -219,6 +277,13 @@ struct StepRow: View {
 				expandedBody
 			}
 		}
+	}
+
+	/// "Read image" for an image step (the chip carries the name), else the tool text.
+	private var label: String {
+		if entry.role == .thinking { return "Thinking" }
+		if imagePath != nil && entry.text == entry.tool { return "\(entry.text) image" }
+		return entry.text
 	}
 
 	@ViewBuilder private var expandedBody: some View {
@@ -238,6 +303,8 @@ struct StepRow: View {
 				.frame(maxWidth: .infinity, alignment: .leading)
 				.background(Color.surface, in: RoundedRectangle(cornerRadius: 8))
 				.overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.diffDelete.opacity(0.5)))
+		} else if let hunk = entry.hunk {
+			HunkView(hunk: hunk)
 		} else if let detail = entry.detail {
 			Text(detail)
 				.font(.caption.monospaced())
@@ -245,6 +312,131 @@ struct StepRow: View {
 				.padding(.leading, 18)
 				.textSelection(.enabled)
 		}
+	}
+}
+
+/// The Mac's mini diff: mono lines coloured by their `-`/`+`/context prefix.
+struct HunkView: View {
+	let hunk: String
+
+	var body: some View {
+		ScrollView(.horizontal, showsIndicators: false) {
+			VStack(alignment: .leading, spacing: 1) {
+				ForEach(Array(hunk.split(separator: "\n", omittingEmptySubsequences: false).enumerated()), id: \.offset) {
+					_, line in
+					Text(line.isEmpty ? " " : String(line))
+						.font(.caption.monospaced())
+						.foregroundStyle(lineColor(line))
+				}
+			}
+			.padding(8)
+		}
+		.background(Color.surface, in: RoundedRectangle(cornerRadius: 8))
+		.overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.surfaceRaised))
+	}
+
+	private func lineColor(_ line: Substring) -> Color {
+		if line.hasPrefix("+") { return Color.diffAdd }
+		if line.hasPrefix("-") { return Color.diffDelete }
+		return Color(.tertiaryLabel)
+	}
+}
+
+/// The end-of-turn receipt (the Mac's "6m, 59s · file +N −M" row).
+struct TurnSummaryRow: View {
+	let summary: TurnSummary
+
+	var body: some View {
+		ScrollView(.horizontal, showsIndicators: false) {
+			HStack(spacing: 6) {
+				if let seconds = summary.seconds {
+					Text(Duration.seconds(seconds).formatted(.units(width: .narrow, maximumUnitCount: 2)))
+						.font(.caption2.monospacedDigit())
+						.foregroundStyle(.tertiary)
+				}
+				ForEach(summary.files) { file in
+					HStack(spacing: 5) {
+						Text(file.name)
+							.font(.caption.monospaced())
+							.foregroundStyle(.secondary)
+							.lineLimit(1)
+						if file.adds > 0 {
+							Text("+\(file.adds)").font(.caption2.monospacedDigit()).foregroundStyle(Color.diffAdd)
+						}
+						if file.dels > 0 {
+							Text("−\(file.dels)").font(.caption2.monospacedDigit()).foregroundStyle(Color.diffDelete)
+						}
+					}
+					.padding(.horizontal, 8)
+					.padding(.vertical, 3)
+					.background(Color.surfaceRaised.opacity(0.6), in: RoundedRectangle(cornerRadius: 7))
+				}
+			}
+		}
+		.padding(.vertical, 1)
+	}
+}
+
+/// A chip naming a transcript-referenced image; tapping loads it through the
+/// relay's transcript-gated file endpoint and shows it full screen.
+struct ImageChipView: View {
+	let sessionID: String
+	let path: String
+	let name: String
+	@Environment(AppModel.self) private var model
+	@State private var image: UIImage?
+	@State private var showing = false
+	@State private var loading = false
+	@State private var failed = false
+
+	var body: some View {
+		Button {
+			Task { await open() }
+		} label: {
+			HStack(spacing: 5) {
+				if loading {
+					ProgressView().controlSize(.mini)
+				} else {
+					Image(systemName: failed ? "exclamationmark.triangle" : "photo")
+						.font(.caption2)
+						.foregroundStyle(failed ? Color.diffDelete : Color.diffAdd)
+				}
+				Text(name)
+					.font(.caption.monospaced())
+					.foregroundStyle(.secondary)
+					.lineLimit(1)
+			}
+			.padding(.horizontal, 8)
+			.padding(.vertical, 3)
+			.background(Color.surfaceRaised, in: RoundedRectangle(cornerRadius: 7))
+		}
+		.buttonStyle(.plain)
+		.sheet(isPresented: $showing) {
+			if let image {
+				ZStack {
+					Color.black.ignoresSafeArea()
+					Image(uiImage: image)
+						.resizable()
+						.scaledToFit()
+				}
+				.presentationDragIndicator(.visible)
+			}
+		}
+	}
+
+	private func open() async {
+		if image == nil {
+			loading = true
+			defer { loading = false }
+			guard let data = try? await model.client.fileData(sessionID: sessionID, path: path),
+				let loaded = UIImage(data: data)
+			else {
+				failed = true
+				return
+			}
+			image = loaded
+		}
+		showing = true
 	}
 }
 
@@ -264,6 +456,7 @@ func toolSymbol(_ tool: String?) -> String {
 /// updating while the agent works — a closed group still reads as live.
 struct StepGroupView: View {
 	let group: StepGroup
+	let sessionID: String
 	@State private var expanded = false
 
 	var body: some View {
@@ -298,7 +491,7 @@ struct StepGroupView: View {
 			if expanded {
 				VStack(alignment: .leading, spacing: 5) {
 					ForEach(group.entries) { entry in
-						StepRow(entry: entry)
+						StepRow(entry: entry, sessionID: sessionID)
 					}
 				}
 				.padding(.leading, 14)

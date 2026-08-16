@@ -327,10 +327,48 @@ public struct TranscriptEntry: Codable, Sendable, Identifiable, Equatable {
 	public let ts: String
 	/// Typed into Conductor's queue but not yet dispatched to the agent.
 	public let queued: Bool
+	/// Files the user attached on the Mac — rendered as chips under the bubble.
+	public let attachments: [AttachmentRef]?
+	/// Conductor's turn id — groups a turn's entries for the end-of-turn summary.
+	public let turnId: String?
+	/// Line counts for a file-editing tool call, plus the clipped hunk behind the chip.
+	public let adds: Int?
+	public let dels: Int?
+	public let hunk: String?
 
 	/// Stable list key (mirrors the PWA's `${rowid}-${id}`).
 	public var key: String { "\(rowid)-\(id)" }
 	public var isError: Bool { error == true }
+
+	/// Explicit because the new optional fields default to nil — the memberwise
+	/// init would force every construction site (tests) to name all of them.
+	public init(
+		id: String, rowid: Int64, role: Role, text: String, tool: String?, detail: String?, error: Bool?,
+		ts: String, queued: Bool, attachments: [AttachmentRef]? = nil, turnId: String? = nil,
+		adds: Int? = nil, dels: Int? = nil, hunk: String? = nil
+	) {
+		self.id = id
+		self.rowid = rowid
+		self.role = role
+		self.text = text
+		self.tool = tool
+		self.detail = detail
+		self.error = error
+		self.ts = ts
+		self.queued = queued
+		self.attachments = attachments
+		self.turnId = turnId
+		self.adds = adds
+		self.dels = dels
+		self.hunk = hunk
+	}
+}
+
+/// One attachment reference from a user prompt: display name + worktree-relative path.
+public struct AttachmentRef: Codable, Sendable, Equatable, Identifiable {
+	public let name: String
+	public let path: String
+	public var id: String { path }
 }
 
 public struct MessagesResponse: Codable, Sendable {

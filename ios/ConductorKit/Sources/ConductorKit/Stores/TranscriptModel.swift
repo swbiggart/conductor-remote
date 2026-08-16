@@ -26,11 +26,17 @@ public final class TranscriptModel {
 		self.sessionID = sessionID
 	}
 
+	/// Whether the trailing turn is live — while true the fold keeps the final
+	/// run of steps as individual rows and withholds its summary (the Mac's
+	/// behaviour). Set from the session's working status by the ticks.
+	private var trailingTurnActive = false
+
 	/// Returns the trimmed texts of newly-arrived user rows so the send
 	/// pipeline can retire matching optimistic bubbles.
 	@discardableResult
-	public func apply(_ response: MessagesResponse) -> [String] {
+	public func apply(_ response: MessagesResponse, trailingTurnActive: Bool? = nil) -> [String] {
 		loaded = true
+		if let trailingTurnActive { self.trailingTurnActive = trailingTurnActive }
 		guard !response.entries.isEmpty else { return [] }
 		entries.append(contentsOf: response.entries)
 		cursor = max(cursor, response.cursor)
@@ -38,7 +44,16 @@ public final class TranscriptModel {
 		// nothing, and group identity is stable (first row's key) so SwiftUI
 		// keeps expansion state. Don't add incremental merge complexity until
 		// a profile demands it.
-		items = TranscriptGrouping.fold(entries)
+		items = TranscriptGrouping.fold(entries, trailingTurnActive: self.trailingTurnActive)
 		return response.entries.filter { $0.role == .user }.map(\.text)
+	}
+
+	/// Working flipped with no new rows (the sessions poll saw the turn end or
+	/// start): refold so the live steps collapse — or a fresh turn's unfold —
+	/// without waiting for the next message.
+	public func setTrailingTurnActive(_ active: Bool) {
+		guard active != trailingTurnActive else { return }
+		trailingTurnActive = active
+		items = TranscriptGrouping.fold(entries, trailingTurnActive: active)
 	}
 }

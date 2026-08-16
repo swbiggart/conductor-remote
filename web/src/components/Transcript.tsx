@@ -1,5 +1,5 @@
 import { useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, Loader2 } from 'lucide-react'
+import { AlertTriangle, FileText, Image as ImageIcon, Loader2 } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useSendPrompt, useTranscript } from '../hooks.ts'
 import { client } from '../lib/api.ts'
@@ -114,11 +114,13 @@ export function Transcript({
 					<Empty>No messages yet.</Empty>
 				) : (
 					<div className="flex min-w-0 flex-col gap-2.5">
-						{groupSteps(entries).map(row =>
+						{buildRows(entries, working ?? false).map(row =>
 							row.kind === 'steps' ? (
-								<StepGroup key={row.key} entries={row.entries} />
+								<StepGroup key={row.key} entries={row.entries} sessionId={sessionId} />
+							) : row.kind === 'turn' ? (
+								<TurnSummaryRow key={row.key} files={row.files} seconds={row.seconds} />
 							) : (
-								<Entry key={row.key} e={row.e} />
+								<Entry key={row.key} e={row.e} sessionId={sessionId} />
 							)
 						)}
 						{visiblePending.map(p => (
@@ -161,20 +163,36 @@ export function Transcript({
 type Row =
 	| { kind: 'entry'; key: string; e: TranscriptEntry }
 	| { kind: 'steps'; key: string; entries: TranscriptEntry[] }
+	| { kind: 'turn'; key: string; files: TurnFile[]; seconds: number | null }
+
+interface TurnFile {
+	name: string
+	adds: number
+	dels: number
+}
 
 const rowKey = (e: TranscriptEntry) => `${e.rowid}-${e.id}`
+
+/** Both timestamp shapes the relay serves: ISO (with ms) and SQLite's UTC-sans-Z. */
+const parseTs = (ts: string): number | null => {
+	const ms = Date.parse(ts.includes('T') ? ts : `${ts.replace(' ', 'T')}Z`)
+	return Number.isNaN(ms) ? null : ms
+}
 
 /**
  * Fold each run of the agent's own work (thinking + tool calls) between two
  * spoken messages into one collapsible group — a turn is mostly plumbing, and on
  * a phone that plumbing buries the prose. A run of one stays inline: wrapping a
- * single row in a disclosure hides it without saving anything.
+ * single row in a disclosure hides it without saving anything. While the agent
+ * is working, the trailing run stays as individual live rows (the Mac's
+ * behaviour) and folds only once the turn ends — group identity is the first
+ * row's key either way, so the collapse doesn't lose expansion state elsewhere.
  */
-function groupSteps(entries: TranscriptEntry[]): Row[] {
+function groupSteps(entries: TranscriptEntry[], unfoldTrailing = false): Row[] {
 	const rows: Row[] = []
 	let run: TranscriptEntry[] = []
-	const flush = () => {
-		if (run.length > 1) rows.push({ kind: 'steps', key: `steps-${rowKey(run[0])}`, entries: run })
+	const flush = (asIndividual = false) => {
+		if (!asIndividual && run.length > 1) rows.push({ kind: 'steps', key: `steps-${rowKey(run[0])}`, entries: run })
 		else for (const e of run) rows.push({ kind: 'entry', key: rowKey(e), e })
 		run = []
 	}
@@ -186,8 +204,82 @@ function groupSteps(entries: TranscriptEntry[]): Row[] {
 		flush()
 		rows.push({ kind: 'entry', key: rowKey(e), e })
 	}
-	flush()
+	flush(unfoldTrailing)
 	return rows
+}
+
+/**
+ * The full row stream: entries segmented into turns (`turnId`, NULL on
+ * pre-May-2026 rows — those merge into one summary-less span), steps folded per
+ * turn, and a Mac-style summary row — duration plus per-file `+N −M` chips —
+ * after each *completed* turn that edited files. The trailing turn gets its
+ * summary (and its fold) only once the agent stops working.
+ */
+function buildRows(entries: TranscriptEntry[], working: boolean): Row[] {
+	const turns: TranscriptEntry[][] = []
+	let lastTurnId: string | undefined
+	for (const e of entries) {
+		if (!turns.length || (e.turnId && lastTurnId && e.turnId !== lastTurnId)) turns.push([])
+		turns[turns.length - 1].push(e)
+		if (e.turnId) lastTurnId = e.turnId
+	}
+	const rows: Row[] = []
+	turns.forEach((turn, i) => {
+		const trailing = i === turns.length - 1
+		rows.push(...groupSteps(turn, trailing && working))
+		if (trailing && working) return
+		const summary = turnSummary(turn)
+		if (summary) rows.push(summary)
+	})
+	return rows
+}
+
+/** Per-file totals + elapsed for one turn, or null when it edited nothing. */
+function turnSummary(turn: TranscriptEntry[]): Row | null {
+	const edits = turn.filter(e => e.adds !== undefined || e.dels !== undefined)
+	if (!edits.length || !turn.some(e => e.turnId)) return null
+	const byFile = new Map<string, TurnFile>()
+	for (const e of edits) {
+		const name = basename(e.detail ?? '') || 'files'
+		const file = byFile.get(name) ?? { name, adds: 0, dels: 0 }
+		file.adds += e.adds ?? 0
+		file.dels += e.dels ?? 0
+		byFile.set(name, file)
+	}
+	const first = parseTs(turn[0].ts)
+	const last = parseTs(turn[turn.length - 1].ts)
+	const seconds = first !== null && last !== null && last > first ? Math.round((last - first) / 1000) : null
+	return { kind: 'turn', key: `turn-${rowKey(turn[0])}`, files: [...byFile.values()], seconds }
+}
+
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|heic)$/i
+const basename = (p: string) => p.split('/').pop() ?? p
+
+/** "6m 59s" — coarse, no live ticking (this row only exists for finished turns). */
+function turnDuration(seconds: number): string {
+	if (seconds < 60) return `${seconds}s`
+	const m = Math.floor(seconds / 60)
+	if (m < 60) return `${m}m ${seconds % 60}s`
+	return `${Math.floor(m / 60)}h ${m % 60}m`
+}
+
+/** The end-of-turn receipt: how long it ran, which files it touched, how much. */
+function TurnSummaryRow({ files, seconds }: { files: TurnFile[]; seconds: number | null }) {
+	return (
+		<div className="flex flex-wrap items-center gap-1.5 px-0.5 text-[11px] text-faint">
+			{seconds !== null ? <span className="shrink-0">{turnDuration(seconds)}</span> : null}
+			{files.map(f => (
+				<span
+					key={f.name}
+					className="flex items-center gap-1.5 rounded-md border border-border-soft bg-surface/60 px-2 py-0.5 font-mono"
+				>
+					<span className="max-w-40 truncate text-muted">{f.name}</span>
+					{f.adds ? <span className="text-add">+{f.adds}</span> : null}
+					{f.dels ? <span className="text-del">−{f.dels}</span> : null}
+				</span>
+			))}
+		</div>
+	)
 }
 
 /**
@@ -196,7 +288,7 @@ function groupSteps(entries: TranscriptEntry[]): Row[] {
  * as live activity without being opened, and any tool failure inside is counted
  * on the header rather than hidden behind it.
  */
-function StepGroup({ entries }: { entries: TranscriptEntry[] }) {
+function StepGroup({ entries, sessionId }: { entries: TranscriptEntry[]; sessionId: string | null }) {
 	const failed = entries.filter(e => e.error).length
 	const last = entries[entries.length - 1]
 	const lastLabel = last.role === 'thinking' ? 'Thinking' : last.text
@@ -212,10 +304,56 @@ function StepGroup({ entries }: { entries: TranscriptEntry[] }) {
 			</summary>
 			<div className="flex min-w-0 flex-col gap-2.5 border-t border-border-soft px-2 py-2.5">
 				{entries.map(e => (
-					<Entry key={rowKey(e)} e={e} />
+					<Entry key={rowKey(e)} e={e} sessionId={sessionId} />
 				))}
 			</div>
 		</details>
+	)
+}
+
+/**
+ * A chip naming a transcript-referenced image, which taps open in a lightbox.
+ * Fetched with the auth header (an `<img src>` can't carry one) through
+ * `GET /api/sessions/:id/file` — the endpoint only serves paths this chat's
+ * transcript actually references, so the chip can't be aimed anywhere else.
+ */
+function ImageChip({ sessionId, path, name }: { sessionId: string | null; path: string; name: string }) {
+	const token = useApp(s => s.token)
+	const [src, setSrc] = useState<string | null>(null)
+	const [failed, setFailed] = useState(false)
+	const open = async () => {
+		if (src || !sessionId) return
+		try {
+			const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/file?path=${encodeURIComponent(path)}`, {
+				headers: { Authorization: `Bearer ${token ?? ''}` }
+			})
+			if (!r.ok) throw new Error(String(r.status))
+			setSrc(URL.createObjectURL(await r.blob()))
+		} catch {
+			setFailed(true)
+		}
+	}
+	return (
+		<>
+			<button
+				type="button"
+				onClick={open}
+				className="flex max-w-full shrink-0 items-center gap-1.5 rounded-md border border-border-soft bg-surface/80 px-2 py-0.5 font-mono text-[11px] text-muted active:bg-surface-2"
+			>
+				<ImageIcon size={11} className={cn('shrink-0', failed ? 'text-del' : 'text-add')} />
+				<span className="truncate">{name}</span>
+			</button>
+			{src ? (
+				<button
+					type="button"
+					aria-label="Close image"
+					onClick={() => setSrc(null)}
+					className="fixed inset-0 z-50 flex cursor-default items-center justify-center bg-black/80 p-4"
+				>
+					<img src={src} alt={name} className="max-h-full max-w-full rounded-lg object-contain" />
+				</button>
+			) : null}
+		</>
 	)
 }
 
@@ -300,7 +438,7 @@ function PendingEntry({ p, onRetry, onDismiss }: { p: PendingMessage; onRetry: (
 	)
 }
 
-function Entry({ e }: { e: TranscriptEntry }) {
+function Entry({ e, sessionId }: { e: TranscriptEntry; sessionId: string | null }) {
 	if (e.role === 'user') {
 		// `data-user-msg` is what MessageNav reads: the entry's position is this node's, and
 		// the attributes are the row it draws in the sheet. Every user-side bubble carries
@@ -311,6 +449,23 @@ function Entry({ e }: { e: TranscriptEntry }) {
 				<Bubble className={cn('max-w-[85%] bg-accent-soft text-text', e.queued && 'opacity-60')}>
 					{e.queued ? <Label>queued</Label> : null}
 					<Markdown>{e.text}</Markdown>
+					{e.attachments?.length ? (
+						<div className="mt-1.5 flex flex-wrap gap-1.5">
+							{e.attachments.map(a =>
+								IMAGE_EXT.test(a.path) ? (
+									<ImageChip key={a.path} sessionId={sessionId} path={a.path} name={a.name} />
+								) : (
+									<span
+										key={a.path}
+										className="flex items-center gap-1.5 rounded-md border border-border-soft bg-surface/80 px-2 py-0.5 font-mono text-[11px] text-muted"
+									>
+										<FileText size={11} className="shrink-0" />
+										<span className="truncate">{a.name}</span>
+									</span>
+								)
+							)}
+						</div>
+					) : null}
 				</Bubble>
 				<span className="pr-1 text-[11px] text-faint">{messageTime(e.ts)}</span>
 			</div>
@@ -325,11 +480,46 @@ function Entry({ e }: { e: TranscriptEntry }) {
 				</div>
 			)
 		}
+		// An edit with a hunk expands into the Mac-style mini diff; the row itself
+		// carries the file chip with its +N −M.
+		const isEdit = e.adds !== undefined || e.dels !== undefined
+		const imagePath = e.detail && IMAGE_EXT.test(e.detail) ? e.detail : null
+		const rowBody = (
+			<>
+				<span className="shrink-0 font-mono text-[11px] text-faint">▸</span>
+				<span className={cn('truncate text-[12.5px] text-muted', imagePath ? 'shrink-0' : 'max-w-full')}>
+					{imagePath && e.text === e.tool ? `${e.text} image` : e.text}
+				</span>
+				{imagePath ? (
+					<ImageChip sessionId={sessionId} path={imagePath} name={basename(imagePath)} />
+				) : isEdit && e.detail ? (
+					<span className="flex min-w-0 flex-1 items-baseline gap-1.5 font-mono text-[11px]">
+						<span className="truncate text-faint">{basename(e.detail)}</span>
+						{e.adds ? <span className="shrink-0 text-add">+{e.adds}</span> : null}
+						{e.dels ? <span className="shrink-0 text-del">−{e.dels}</span> : null}
+					</span>
+				) : e.detail ? (
+					<span className="min-w-0 flex-1 truncate font-mono text-[11px] text-faint">{e.detail}</span>
+				) : null}
+			</>
+		)
+		if (e.hunk) {
+			return (
+				<details className="group/hunk min-w-0 overflow-hidden rounded-xl border border-border-soft bg-surface/60">
+					<summary className="flex cursor-pointer select-none list-none items-baseline gap-2 overflow-hidden whitespace-nowrap px-3 py-1.5 [&::-webkit-details-marker]:hidden">
+						{rowBody}
+					</summary>
+					{/* biome-ignore format: keep the map inline so <pre> spacing stays exact */}
+					<pre className="overflow-x-auto border-t border-border-soft px-3 py-2 font-mono text-[11px] leading-relaxed">{e.hunk.split('\n').map((line, i) => (
+						// biome-ignore lint/suspicious/noArrayIndexKey: a hunk is an immutable string — its lines never reorder
+						<div key={i} className={line.startsWith('+') ? 'text-add' : line.startsWith('-') ? 'text-del' : 'text-faint'}>{line || ' '}</div>
+					))}</pre>
+				</details>
+			)
+		}
 		return (
 			<div className="flex min-w-0 items-baseline gap-2 overflow-hidden whitespace-nowrap rounded-xl border border-border-soft bg-surface/60 px-3 py-1.5">
-				<span className="shrink-0 font-mono text-[11px] text-faint">▸</span>
-				<span className="max-w-full truncate text-[12.5px] text-muted">{e.text}</span>
-				{e.detail ? <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-faint">{e.detail}</span> : null}
+				{rowBody}
 			</div>
 		)
 	}

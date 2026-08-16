@@ -4,11 +4,12 @@ import Testing
 @testable import ConductorKit
 
 private func entry(
-	_ rowid: Int64, _ role: Role, text: String = "", error: Bool = false, queued: Bool = false
+	_ rowid: Int64, _ role: Role, text: String = "", error: Bool = false, queued: Bool = false,
+	turnId: String? = nil, detail: String? = nil, adds: Int? = nil, dels: Int? = nil, ts: String = "2026-08-15 10:00:00"
 ) -> TranscriptEntry {
 	TranscriptEntry(
-		id: "\(rowid)", rowid: rowid, role: role, text: text, tool: nil, detail: nil,
-		error: error ? true : nil, ts: "2026-08-15 10:00:00", queued: queued)
+		id: "\(rowid)", rowid: rowid, role: role, text: text, tool: nil, detail: detail,
+		error: error ? true : nil, ts: ts, queued: queued, turnId: turnId, adds: adds, dels: dels)
 }
 
 @Suite struct GroupingTests {
@@ -44,6 +45,45 @@ private func entry(
 			return
 		}
 		#expect(group.lastLabel == "Thinking")
+	}
+
+	@Test func trailingRunStaysLiveWhileWorking() {
+		let entries = [entry(1, .user, turnId: "t1"), entry(2, .tool, turnId: "t1"), entry(3, .tool, turnId: "t1")]
+		// Working: each trailing step is its own live row, and no summary yet.
+		let live = TranscriptGrouping.fold(entries, trailingTurnActive: true)
+		#expect(live.count == 3)
+		guard case .step = live[1], case .step = live[2] else {
+			Issue.record("live trailing steps should stay individual")
+			return
+		}
+		// Turn over: the same run folds, group id = first row's key as always.
+		let done = TranscriptGrouping.fold(entries, trailingTurnActive: false)
+		guard case .steps(let group) = done[1] else {
+			Issue.record("finished trailing run should fold")
+			return
+		}
+		#expect(group.id == entries[1].key)
+	}
+
+	@Test func completedTurnGetsSummaryWithFileTotals() {
+		let items = TranscriptGrouping.fold([
+			entry(1, .user, turnId: "t1", ts: "2026-08-15 10:00:00"),
+			entry(2, .tool, turnId: "t1", detail: "src/a.ts", adds: 3, dels: 1),
+			entry(3, .tool, turnId: "t1", detail: "src/a.ts", adds: 2),
+			entry(4, .assistant, turnId: "t1", ts: "2026-08-15 10:01:30"),
+			entry(5, .user, turnId: "t2"),
+			entry(6, .assistant, turnId: "t2")
+		])
+		guard case .turnSummary(let summary) = items.first(where: { if case .turnSummary = $0 { true } else { false } })
+		else {
+			Issue.record("edited turn should get a summary")
+			return
+		}
+		// Per-file totals aggregate across the turn's edits; names are basenames.
+		#expect(summary.files == [TurnSummary.File(name: "a.ts", adds: 5, dels: 1)])
+		#expect(summary.seconds == 90)
+		// The second turn edited nothing → exactly one summary in the stream.
+		#expect(items.count(where: { if case .turnSummary = $0 { true } else { false } }) == 1)
 	}
 
 	@Test func groupIdentityStableAcrossAppends() {

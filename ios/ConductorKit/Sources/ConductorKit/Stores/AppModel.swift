@@ -248,6 +248,15 @@ public final class AppModel {
 		return false
 	}
 
+	/// Same question by id, across whatever workspace's sessions are cached.
+	/// Nil when the session isn't cached anywhere — caller keeps its last state.
+	private func sessionWorking(_ sessionID: String) -> Bool? {
+		for sessions in sessionsByWorkspace.values {
+			if let session = sessions.first(where: { $0.id == sessionID }) { return isWorking(session: session) }
+		}
+		return nil
+	}
+
 	/// What the elapsed timer counts from: `turn_started_at` when the DB
 	/// agrees it's working (steering doesn't move it), else the local hint's
 	/// start. Nil → show the dots with no timer (pre-May-2026 sessions).
@@ -277,13 +286,18 @@ public final class AppModel {
 				if let response = try await client.sessions(workspaceID: workspaceID) {
 					sessionsByWorkspace[workspaceID] = response.sessions
 					autoFocusSession(workspaceID: workspaceID)
+					// A turn ending (or starting) between messages ticks must
+					// collapse (or unfold) the live steps without new rows.
+					for session in response.sessions {
+						transcripts[session.id]?.setTrailingTurnActive(isWorking(session: session))
+					}
 				}
 				markSynced()
 			case .messages(let sessionID):
 				let model = transcript(sessionID: sessionID)
 				let cursor = model.cursor
 				if let response = try await client.messages(sessionID: sessionID, after: cursor) {
-					let newUserTexts = model.apply(response)
+					let newUserTexts = model.apply(response, trailingTurnActive: sessionWorking(sessionID))
 					sends.reconcile(sessionID: sessionID, userTexts: newUserTexts)
 					Self.syncLog.info(
 						"messages \(sessionID.prefix(8), privacy: .public) after=\(cursor) got \(response.entries.count) → items \(model.items.count)"

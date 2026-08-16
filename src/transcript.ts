@@ -38,6 +38,14 @@ export interface TranscriptEntry {
 	queued: boolean
 	/** Files the user attached on the Mac, parsed out of Conductor's `@⟦name⟧(path)` markup. */
 	attachments?: AttachmentRef[]
+	/** Conductor's turn id — what groups a turn's entries for duration + per-file summaries. */
+	turnId?: string
+	/** Lines added by an Edit/Write/MultiEdit tool call (common prefix/suffix trimmed first). */
+	adds?: number
+	/** Lines removed, same accounting. */
+	dels?: number
+	/** A clipped unified-style hunk of the change (`-`/`+`/context-prefixed lines). */
+	hunk?: string
 }
 
 /** One attachment reference: display name + worktree-relative path on disk. */
@@ -67,6 +75,8 @@ interface RawRow {
 	created_at: string
 	sent_at: string | null
 	queue_order: number | null
+	/** Optional so call sites that don't select it (tail scans) still typecheck. */
+	turn_id?: string | null
 }
 
 interface SdkBlock {
@@ -92,19 +102,118 @@ function stripWorktree(s: string, worktree: string | null): string {
 	return s.replaceAll(`${worktree}/`, '').replaceAll(worktree, '.')
 }
 
+/** What a per-edit diff boils down to on the wire. */
+interface EditDiff {
+	adds: number
+	dels: number
+	hunk?: string
+}
+
+/**
+ * Line counts + a clipped hunk for one old→new string pair. Common prefix and
+ * suffix lines are trimmed first: an Edit's strings are one contiguous region
+ * plus the context Claude needed to anchor it, so what's left after trimming is
+ * the actual change — the same accounting behind Conductor's own `+N −M` chips.
+ * One context line each side keeps the hunk readable without shipping anchors.
+ */
+function diffStrings(oldStr: string, newStr: string): EditDiff {
+	const a = oldStr.split('\n')
+	const b = newStr.split('\n')
+	let start = 0
+	while (start < a.length && start < b.length && a[start] === b[start]) start++
+	let endA = a.length
+	let endB = b.length
+	while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+		endA--
+		endB--
+	}
+	const dels = endA - start
+	const adds = endB - start
+	if (!adds && !dels) return { adds, dels }
+	const lines: string[] = []
+	if (start > 0) lines.push(` ${a[start - 1]}`)
+	for (const line of a.slice(start, endA)) lines.push(`-${line}`)
+	for (const line of b.slice(start, endB)) lines.push(`+${line}`)
+	if (endA < a.length) lines.push(` ${a[endA]}`)
+	return { adds, dels, hunk: clipHunk(lines) }
+}
+
+/** Hunks ride the 1s poll, so they are clipped hard — the workspace diff view has the rest. */
+function clipHunk(lines: string[], maxLines = 60, maxChars = 4000): string {
+	const kept =
+		lines.length > maxLines ? [...lines.slice(0, maxLines), `… ${lines.length - maxLines} more lines`] : lines
+	const joined = kept.join('\n')
+	return joined.length > maxChars ? `${joined.slice(0, maxChars)}\n…` : joined
+}
+
+/** Raw string, untrimmed — the diff must see real line boundaries, unlike `str()`. */
+const raw = (v: unknown) => (typeof v === 'string' ? v : undefined)
+
+/** Change accounting for the file-editing tools, from their own inputs. */
+function editDiff(name: string, o: Record<string, unknown>): EditDiff | null {
+	if (name === 'Edit') {
+		const oldStr = raw(o.old_string)
+		const newStr = raw(o.new_string)
+		if (oldStr === undefined || newStr === undefined) return null
+		return diffStrings(oldStr, newStr)
+	}
+	if (name === 'Write') {
+		const content = raw(o.content)
+		if (content === undefined) return null
+		// No old content in the input — a Write counts as all-new, like `git diff` on a new file.
+		return diffStrings('', content)
+	}
+	if (name === 'MultiEdit' && Array.isArray(o.edits)) {
+		const total: EditDiff = { adds: 0, dels: 0 }
+		const hunks: string[] = []
+		for (const edit of o.edits as Record<string, unknown>[]) {
+			const oldStr = raw(edit?.old_string)
+			const newStr = raw(edit?.new_string)
+			if (oldStr === undefined || newStr === undefined) continue
+			const d = diffStrings(oldStr, newStr)
+			total.adds += d.adds
+			total.dels += d.dels
+			if (d.hunk) hunks.push(d.hunk)
+		}
+		if (hunks.length) total.hunk = clipHunk(hunks.join('\n \n').split('\n'))
+		return total
+	}
+	if (name === 'NotebookEdit') {
+		const source = raw(o.new_source)
+		if (source === undefined) return null
+		return diffStrings('', source)
+	}
+	return null
+}
+
 /**
  * Mirror Conductor's one-line tool rows: the human description as the title
  * (Bash always has one), the primary input as a mono detail. Tools without a
  * recognizable primary input get the title alone — dumping raw JSON is noise.
+ * File-editing tools additionally carry `adds`/`dels` and a clipped hunk, the
+ * data behind the Mac-style `+N −M` chips and tap-to-expand diffs.
  */
-function summarizeToolUse(name: string, input: unknown, worktree: string | null): { text: string; detail?: string } {
+function summarizeToolUse(
+	name: string,
+	input: unknown,
+	worktree: string | null
+): { text: string; detail?: string; adds?: number; dels?: number; hunk?: string } {
 	if (!input || typeof input !== 'object') return { text: name }
 	const o = input as Record<string, unknown>
 	const text = str(o.description) ?? name
 	const detail =
-		str(o.command) ?? str(o.file_path) ?? str(o.path) ?? str(o.pattern) ?? str(o.url) ?? str(o.skill) ?? str(o.prompt)
-	if (!detail || detail === text) return { text }
-	return { text, detail: clip(stripWorktree(detail, worktree).replace(/\s+/g, ' '), 160) }
+		str(o.command) ??
+		str(o.file_path) ??
+		str(o.notebook_path) ??
+		str(o.path) ??
+		str(o.pattern) ??
+		str(o.url) ??
+		str(o.skill) ??
+		str(o.prompt)
+	const diff = editDiff(name, o)
+	const extra = diff ? { adds: diff.adds, dels: diff.dels, ...(diff.hunk ? { hunk: diff.hunk } : {}) } : {}
+	if (!detail || detail === text) return { text, ...extra }
+	return { text, detail: clip(stripWorktree(detail, worktree).replace(/\s+/g, ' '), 160), ...extra }
 }
 
 /**
@@ -185,17 +294,18 @@ function parseAttachmentRefs(content: string): { text: string; attachments?: Att
 				path = decodeURIComponent(encoded)
 			} catch {}
 			attachments.push({ name, path })
-			// Plain text, no emoji: iOS renders unsupported glyphs as tofu, and
-			// clients that read `attachments` will replace this with a real chip.
-			return `(${name})`
+			// Removed from the text entirely — clients render `attachments` as
+			// chips, and no inline marker survives being shown raw somewhere.
+			return ''
 		})
+		.replace(/[^\S\n]{2,}/g, ' ')
 		.trim()
 	return attachments.length ? { text, attachments } : { text: content }
 }
 
 export function parseMessage(row: RawRow, worktree: string | null = null): TranscriptEntry[] {
 	const queued = row.queue_order !== null && row.sent_at === null
-	const base = { rowid: row.rowid, ts: row.created_at, queued }
+	const base = { rowid: row.rowid, ts: row.created_at, queued, ...(row.turn_id ? { turnId: row.turn_id } : {}) }
 	const content = row.content ?? ''
 
 	// Plain user prompt (not SDK JSON) — the only source of real user bubbles.

@@ -67,7 +67,10 @@ struct MessageNavigator: View {
 							.lineLimit(2)
 						Spacer()
 						if let date = SQLiteDate.parse(entry.ts) {
-							Text(date, style: .relative)
+							// One coarse unit ("51 min. ago"), never the self-ticking
+							// two-unit style — seconds are noise at this altitude and
+							// the ticking redrew the sheet every second.
+							Text(date, format: .relative(presentation: .numeric, unitsStyle: .narrow))
 								.font(.caption2)
 								.foregroundStyle(.tertiary)
 						}

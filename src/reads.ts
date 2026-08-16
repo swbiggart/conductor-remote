@@ -461,6 +461,11 @@ export class Reads {
 	/** Session → worktree path, cached: it's stable for a session's lifetime and polled every tick. */
 	private readonly worktreeBySession = new Map<string, string | null>()
 
+	/** The session's worktree on disk — the base transcript-referenced relative paths resolve against. */
+	worktreeFor(sessionId: string): string | null {
+		return this.sessionWorktree(sessionId)
+	}
+
 	private sessionWorktree(sessionId: string): string | null {
 		const cached = this.worktreeBySession.get(sessionId)
 		if (cached !== undefined) return cached
@@ -496,8 +501,9 @@ export class Reads {
 			created_at: string
 			sent_at: string | null
 			queue_order: number | null
+			turn_id: string | null
 		}>(
-			`SELECT rowid, id, role, content, full_message, created_at, sent_at, queue_order
+			`SELECT rowid, id, role, content, full_message, created_at, sent_at, queue_order, turn_id
 			 FROM session_messages
 			 WHERE session_id = ? AND rowid > ?
 			 ORDER BY rowid ASC`,
