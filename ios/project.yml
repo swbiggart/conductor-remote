@@ -1,0 +1,46 @@
+# XcodeGen spec — the .xcodeproj is generated, never committed:
+#   brew install xcodegen && cd ios && xcodegen generate
+# Simulator builds need no signing. For a device build, set your personal team
+# once in Xcode's Signing pane (the gitignored project keeps it locally), or
+# export CONDUCTOR_DEV_TEAM before generating.
+name: ConductorRemote
+options:
+  bundleIdPrefix: com.biggart
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+packages:
+  ConductorKit:
+    path: ConductorKit
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    DEVELOPMENT_TEAM: ${CONDUCTOR_DEV_TEAM}
+    CODE_SIGN_STYLE: Automatic
+targets:
+  ConductorRemote:
+    type: application
+    platform: iOS
+    sources:
+      - path: App/Sources
+    dependencies:
+      - package: ConductorKit
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Conductor
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        ITSAppUsesNonExemptEncryption: false
+        NSCameraUsageDescription: >-
+          The camera scans the pairing QR code shown by the relay on your Mac.
+        NSAppTransportSecurity:
+          # The relay is HTTPS via Tailscale in normal use; the loopback
+          # exception exists for simulator runs against 127.0.0.1:8787.
+          NSAllowsLocalNetworking: true
