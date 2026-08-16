@@ -207,10 +207,14 @@ export const client = {
 			{ method: 'POST', body: JSON.stringify({ ...patch, workspaceId }) },
 			ACTION_TIMEOUT_MS
 		),
-	/** Model labels read off Conductor's live picker (it briefly opens the menu). */
-	models: (sessionId: string, workspaceId: string) =>
+	/**
+	 * The models this chat can run. Served instantly from the relay's catalog
+	 * (extracted from Conductor's own binary); `refresh` opens the real picker on
+	 * the Mac — the manual escape hatch for a catalog that disagrees with the menu.
+	 */
+	models: (sessionId: string, workspaceId: string, refresh = false) =>
 		api<ModelsResult>(
-			`/api/sessions/${encodeURIComponent(sessionId)}/models?workspaceId=${encodeURIComponent(workspaceId)}`,
+			`/api/sessions/${encodeURIComponent(sessionId)}/models?workspaceId=${encodeURIComponent(workspaceId)}${refresh ? '&refresh=1' : ''}`,
 			{},
 			ACTION_TIMEOUT_MS
 		),

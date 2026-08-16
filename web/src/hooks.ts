@@ -371,7 +371,9 @@ export function useModels(session: Session | undefined, workspaceId: string, ena
 		queryFn: async () => {
 			const r = await client.models((session as Session).id, workspaceId)
 			if (!r.ok || !r.models?.length) throw new Error(r.error ?? 'could not read the model list')
-			writeModelCache(agentType, r.models, Date.now())
+			// Entries (id+label) ride into the persisted cache — they're what lets the
+			// picker stage ids while showing labels (lib/models.ts).
+			writeModelCache(agentType, r.models, Date.now(), r.entries)
 			return r.models
 		},
 		enabled: enabled && !!session,

@@ -60,6 +60,11 @@
 	aborts *before* typing — landing in the wrong chat is worse than not sending.
 *)
 
+-- Sidebar sections this run expanded to reach a hidden row (setWorkspaceStatus).
+-- Recorded so restoreExpandedSections can collapse them again: a phone action
+-- must not rearrange the sidebar someone deliberately folded.
+property gExpandedSections : {}
+
 on splitLines(s)
 	set saved to AppleScript's text item delimiters
 	set AppleScript's text item delimiters to linefeed
@@ -750,6 +755,50 @@ on pasteComposer()
 	end tell
 end pasteComposer
 
+on pressSendButton()
+	-- Press the composer's own send control instead of typing Enter. Two things
+	-- Enter can't give: an AXPress works on a *background* app (a keystroke goes to
+	-- whatever is frontmost, which is why the silent path below needs this), and it
+	-- can't be swallowed by a focus that moved. Fail-closed: only a *unique* button
+	-- whose name says send is pressed — anything else returns false and the caller
+	-- keeps the Enter keystroke, so an unmapped Conductor build loses nothing.
+	try
+		set hits to {}
+		repeat with entry in my composerControls()
+			set c to contents of entry
+			if (my axRole(c)) is "AXButton" and (my tabLabel(c)) contains "send" then set end of hits to c
+		end repeat
+		if (count of hits) is not 1 then return false
+		tell application "System Events" to tell process "Conductor"
+			perform action "AXPress" of (item 1 of hits)
+		end tell
+		return true
+	on error
+		return false
+	end try
+end pressSendButton
+
+on silentSend(promptText)
+	-- The activation-free fast path: when Conductor already shows the target chat,
+	-- a send needs no `activate` at all — every step below is an AX read, set or
+	-- press, and those work on a background app. The person at the Mac keeps their
+	-- focus; the phone's send lands silently behind it. Any surprise — no window
+	-- (also the locked/full-screen case: AX sees neither), wrong pane, unmapped
+	-- send button — returns false and the activation ladder takes over, so this
+	-- can only ever *save* the disruption, never trade correctness for it.
+	-- fillComposer *sets* AXValue rather than appending, so a false return after a
+	-- successful fill leaves nothing the ladder's own fill wouldn't replace.
+	try
+		if not (my hasWindow()) then return false
+		if not (my atTargetWorkspace()) then return false
+		my selectChatTab()
+		if not (my fillComposer(promptText)) then return false
+		return my pressSendButton()
+	on error
+		return false
+	end try
+end silentSend
+
 on selectChatTab()
 	set wantIndex to (system attribute "RELAY_TAB_INDEX") as integer
 	if wantIndex is 0 then return
@@ -891,6 +940,19 @@ on firstLine(s)
 	return item 1 of parts
 end firstLine
 
+on remainderIsBadge(label, wanted)
+	-- "Opus 5 NEW" is the wanted "Opus 5" plus a badge; "Opus 5 1M" is a
+	-- different model. The distinction is what lets a catalog-derived label
+	-- (which never carries badges) press the badged menu item and nothing else.
+	if not (label starts with wanted) then return false
+	if (length of label) is (length of wanted) then return false
+	set leftover to text ((length of wanted) + 1) thru -1 of label
+	repeat with badgeWord in (words of leftover)
+		if (badgeWord as text) is not in {"NEW", "BETA", "PREVIEW"} then return false
+	end repeat
+	return true
+end remainderIsBadge
+
 on setModel(wanted)
 	set popup to missing value
 	repeat with entry in my composerControls()
@@ -903,10 +965,12 @@ on setModel(wanted)
 		perform action "AXPress" of popup
 	end tell
 	delay 1.0
-	-- Menu labels carry badges ("Opus 5 NEW"), so an exact match is preferred but a
-	-- prefix match is accepted — except when it is ambiguous ("Sonnet 4.6" would
-	-- otherwise also match "Sonnet 4.6 1M"), which must fail rather than guess.
+	-- Menu labels carry badges ("Opus 5 NEW"), so the match runs in tiers: exact,
+	-- then wanted-plus-badge-words only, then unique prefix — which must fail when
+	-- ambiguous ("Sonnet 4.6" would otherwise also match "Sonnet 4.6 1M") rather
+	-- than guess.
 	set chosen to missing value
+	set badged to {}
 	set loose to {}
 	set wa to my webArea()
 	tell application "System Events" to tell process "Conductor"
@@ -915,16 +979,19 @@ on setModel(wanted)
 				set label to my firstLine(my tabLabel(mi))
 				if label is wanted then
 					set chosen to contents of mi
+				else if my remainderIsBadge(label, wanted) then
+					set end of badged to contents of mi
 				else if label starts with wanted then
 					set end of loose to contents of mi
 				end if
 			end repeat
 		end repeat
 	end tell
+	if chosen is missing value and (count of badged) is 1 then set chosen to item 1 of badged
 	if chosen is missing value and (count of loose) is 1 then set chosen to item 1 of loose
 	if chosen is missing value then
 		tell application "System Events" to key code 53
-		if (count of loose) > 1 then error "several models match " & wanted
+		if (count of loose) > 1 or (count of badged) > 1 then error "several models match " & wanted
 		error "no model named " & wanted
 	end if
 	tell application "System Events" to tell process "Conductor"
@@ -937,7 +1004,13 @@ on setModel(wanted)
 		if my tabLabel(c) contains "Change agent" then set popup to c
 	end repeat
 	if popup is missing value then error "the model picker vanished"
-	if (my tabLabel(popup)) does not contain ("(" & wanted & ")") then error "the model didn't switch to " & wanted
+	-- The popup may echo the badge ("(Opus 5 NEW)"), so accept the exact paren form
+	-- or the badge continuation; a catalog-resolved change is additionally confirmed
+	-- against the DB's model id by the caller (server.ts), which is the strict check.
+	set popupLabel to my tabLabel(popup)
+	if not (popupLabel contains ("(" & wanted & ")") or popupLabel contains ("(" & wanted & " ")) then
+		error "the model didn't switch to " & wanted
+	end if
 end setModel
 
 on listModels()
@@ -1173,16 +1246,135 @@ on dismissMenus()
 	end tell
 end dismissMenus
 
+on axActions(el)
+	tell application "System Events" to tell process "Conductor"
+		try
+			return name of actions of el
+		on error
+			return {}
+		end try
+	end tell
+end axActions
+
+on headerMatches(el, wanted)
+	-- A section header is a pressable non-link named for its group. Rows are
+	-- AXLinks (excluded outright — a branch title could contain a group's words),
+	-- and the name may carry a count ("In progress 3"), so exact-or-prefix.
+	if (my axRole(el)) is "AXLink" then return false
+	set n to my axName(el)
+	if n is "" then return false
+	if not (n is wanted or n starts with (wanted & " ")) then return false
+	return "AXPress" is in (my axActions(el))
+end headerMatches
+
+on sectionHeaderNamed(wanted)
+	-- Depth ≤3 under the web area, same cap and same reason as the menu sweeps:
+	-- the transcript hangs off this root, and rows sit two levels down, so their
+	-- section headers can't be deeper than this.
+	set wa to my webArea()
+	repeat with lvl1 in (my axKids(wa))
+		set a to contents of lvl1
+		if my headerMatches(a, wanted) then return a
+		repeat with lvl2 in (my axKids(a))
+			set b to contents of lvl2
+			if my headerMatches(b, wanted) then return b
+			repeat with lvl3 in (my axKids(b))
+				set c to contents of lvl3
+				if my headerMatches(c, wanted) then return c
+			end repeat
+		end repeat
+	end repeat
+	return missing value
+end sectionHeaderNamed
+
+on pressSectionHeader(wanted)
+	set header to my sectionHeaderNamed(wanted)
+	if header is missing value then return false
+	tell application "System Events" to tell process "Conductor"
+		perform action "AXPress" of header
+	end tell
+	return true
+end pressSectionHeader
+
+on revealViaSectionHeaders()
+	-- Expand the section that should hold the row. RELAY_WS_GROUP names the group
+	-- the relay derives from the workspace's status, tried first; the rest of
+	-- Conductor's groups follow, because a derived status and the sidebar can
+	-- disagree. A press that doesn't produce the row is undone on the spot — the
+	-- header toggles, so a wrong guess would otherwise fold a section the user had
+	-- open. Only a press that *worked* is recorded for restoreExpandedSections.
+	set candidateTitles to {}
+	set groupHint to system attribute "RELAY_WS_GROUP"
+	if groupHint is not "" then set end of candidateTitles to groupHint
+	repeat with fallbackTitle in {"In progress", "In review", "Backlog", "Done", "Canceled", "Archived"}
+		if (fallbackTitle as text) is not groupHint then set end of candidateTitles to (fallbackTitle as text)
+	end repeat
+	repeat with candidateTitle in candidateTitles
+		set sectionName to candidateTitle as text
+		if my pressSectionHeader(sectionName) then
+			set theRow to missing value
+			repeat with attempt from 1 to 6
+				delay 0.25
+				set theRow to my findSidebarRow()
+				if theRow is not missing value then exit repeat
+			end repeat
+			if theRow is not missing value then
+				set end of gExpandedSections to sectionName
+				return theRow
+			end if
+			my pressSectionHeader(sectionName)
+		end if
+	end repeat
+	return missing value
+end revealViaSectionHeaders
+
+on restoreExpandedSections()
+	-- Collapse what revealViaSectionHeaders opened, best-effort: the header handle
+	-- is re-found by name because a status change just moved rows around under it.
+	repeat with sectionName in gExpandedSections
+		try
+			my pressSectionHeader(sectionName as text)
+		end try
+	end repeat
+	set gExpandedSections to {}
+end restoreExpandedSections
+
+on revealSidebarRow()
+	-- The row, made visible if it wasn't: only rendered rows exist in the AX tree,
+	-- so a collapsed section used to be a dead end. Two escalations, cheapest
+	-- first: Conductor's own workspace link navigates by id and reveals the row's
+	-- section when it focuses the workspace (this is the one path here that
+	-- changes what's on screen — the alternative was failing); then the section
+	-- headers directly. Still missing after both → missing value, and the caller
+	-- reports it in words.
+	set theRow to my findSidebarRow()
+	if theRow is not missing value then return theRow
+	set linkURL to system attribute "RELAY_WS_LINK"
+	if linkURL is not "" then
+		try
+			do shell script "open " & quoted form of linkURL
+		end try
+		repeat with attempt from 1 to 8
+			delay 0.3
+			set theRow to my findSidebarRow()
+			if theRow is not missing value then return theRow
+		end repeat
+	end if
+	return my revealViaSectionHeaders()
+end revealSidebarRow
+
 on setWorkspaceStatus()
 	-- Conductor has no menu-bar or palette command for this, so the only lever is
 	-- the sidebar row's own context menu (Mark as unread / Pin / Set status /
 	-- Rename / Copy link / Archive). Right-clicking the row needs no focus change,
-	-- so unlike a send this never disturbs which workspace is on screen.
+	-- so in the common case this never disturbs which workspace is on screen —
+	-- revealSidebarRow's escalations are the exception, and they put back what
+	-- they moved.
 	set wanted to system attribute "RELAY_SET_STATUS"
 	if wanted is "" then error "no status requested"
-	set theRow to my findSidebarRow()
+	set theRow to my revealSidebarRow()
 	if theRow is missing value then
-		error "couldn't find this workspace in the sidebar — a collapsed section hides its row from Accessibility"
+		error "couldn't find this workspace in the sidebar — its section may be collapsed and its group didn't match any known header"
 	end if
 	-- Scroll it into view first. A row that exists in the AX tree but sits outside
 	-- the sidebar's visible strip accepts AXShowMenu and draws nothing — which is
@@ -1207,6 +1399,7 @@ on setWorkspaceStatus()
 	set rowMenu to my waitForMenuWith(my webArea(), 4, "Set status", 6)
 	if rowMenu is missing value then
 		my dismissMenus()
+		my restoreExpandedSections()
 		error "the workspace's menu didn't open — or it no longer offers Set status"
 	end if
 	set statusItem to my menuItemNamed(rowMenu, "Set status")
@@ -1231,6 +1424,7 @@ on setWorkspaceStatus()
 	end repeat
 	if subMenu is missing value then
 		my dismissMenus()
+		my restoreExpandedSections()
 		error "Conductor never offered a status called " & wanted
 	end if
 	set choice to my menuItemNamed(subMenu, wanted)
@@ -1238,4 +1432,5 @@ on setWorkspaceStatus()
 		perform action "AXPress" of choice
 	end tell
 	delay 0.6
+	my restoreExpandedSections()
 end setWorkspaceStatus

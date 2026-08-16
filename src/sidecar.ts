@@ -17,12 +17,33 @@ import path from 'node:path'
  * behind the Actuator interface and falls back to AppleScript when the socket
  * can't be reached (see writes.ts).
  *
- * Reverse-engineered from conductor-runtime (Conductor 0.76):
+ * Re-derived from conductor-runtime 0.81 (2026-08-15; the bundled JS inside the
+ * binary is readable — see memory/FINDINGS for the method):
  *   - socket:      `$TMPDIR/conductor-sidecar-v2-<sidecarPid>.sock`
  *   - transport:   newline-delimited JSON-RPC 2.0 (`{jsonrpc,id,method,params}`)
- *   - local auth:  the literal `{ userId: 'local', auth: 'local' }`
- *   - send prompt: method `query`, params `{ type: 'sendUserMessageRequest', … }`
- *   - safe read:   method `contextUsage`, params `{ sessionId, …auth }`
+ *   - send prompt: method `query`, params `{ type:'query', id:<sessionId>,
+ *                  agentType, message, prompt, options:{ cwd, resume?, … } }` —
+ *                  the 0.76 shape FINDINGS documents, unchanged in 0.81. (The
+ *                  `sendUserMessageRequest` shape this file once sent belongs to
+ *                  the sidecar⇄workspace-host "child bridge" one layer down and
+ *                  is unreachable from the socket.)
+ *   - reads:       `contextUsage`, `getSessionStatus`, `fetchSlashCommands` —
+ *                  request shapes in the same schema bundle.
+ *
+ * Two hazards shape how this is used (see CLAUDE.md ▸ sidecar):
+ *   - **The socket is single-client by design.** Every new connection replaces
+ *     the sidecar's one event tunnel, and closing ours leaves the slot empty
+ *     rather than restoring the app's — live streaming to the desktop UI stalls
+ *     until the app reattaches (events persist to an acked outbox, so nothing is
+ *     lost, but recovery latency is unmeasured). That is why nothing here is
+ *     called casually: `SIDECAR_WHEN_LOCKED=1` scopes sends to a locked Mac,
+ *     where AppleScript is dead and nobody is watching the desktop UI.
+ *   - **A query to a session the sidecar doesn't have live cold-starts an agent
+ *     from the caller's options.** `resume` (Conductor's session id *is* the
+ *     Claude session id) makes that resume the right conversation; the agent
+ *     process is keyed partly by a hash of executable-path/env options, so a
+ *     relay-spawned process can sit beside the app's until one is torn down —
+ *     wasteful, not corrupting, and another reason this stays scoped.
  *
  * Stale socket files from exited sidecars linger in `$TMPDIR`, so discovery is
  * connectivity-based: we try candidates newest-first and use the first that
@@ -30,7 +51,6 @@ import path from 'node:path'
  */
 
 const SOCKET_PREFIX = 'conductor-sidecar-v2-'
-const LOCAL_AUTH = { userId: 'local', auth: 'local' } as const
 
 /** Candidate sidecar socket paths in `$TMPDIR`, newest mtime first. */
 function listSidecarSockets(): string[] {
@@ -169,26 +189,47 @@ export async function sidecarAvailable(): Promise<boolean> {
 	return (await sidecarSocket()) !== null
 }
 
+export interface SidecarSend {
+	/** Conductor session id — also the Claude session id, which is what makes `resume` right. */
+	sessionId: string
+	text: string
+	/** The workspace's worktree — the one required field of `options`. */
+	cwd: string
+	/** `sessions.agent_type`; the wire accepts claude | codex | cursor | acp. */
+	agentType: string
+}
+
 /**
- * Deliver a prompt to a specific session — the real send path, precisely
- * targeted. Resolves once the sidecar has accepted (queued/sent) the message.
+ * Deliver a prompt to a specific session over Conductor's own dispatch socket —
+ * method `query`, the exact call the desktop app makes. `resume: sessionId`
+ * makes a sidecar that doesn't have the session live cold-start the agent
+ * *resuming this conversation* rather than fresh; a session that is live simply
+ * has the message enqueued. The RPC returns void and pushes failures as
+ * `queryError` notifications to whichever connection holds the tunnel, so the
+ * caller must confirm delivery against the transcript (server.ts
+ * `confirmDelivery`) — the receipt, not this call, is the success signal.
  */
-export async function sidecarSendUserMessage(sessionId: string, text: string): Promise<void> {
+export async function sidecarSendUserMessage(send: SidecarSend): Promise<void> {
 	await rpc('query', {
-		type: 'sendUserMessageRequest',
-		...LOCAL_AUTH,
-		sessionId,
-		id: randomUUID(),
-		message: text,
-		agentMessage: text,
-		deliveryMode: 'default'
+		type: 'query',
+		id: send.sessionId,
+		agentType: send.agentType,
+		message: send.text,
+		prompt: send.text,
+		options: {
+			cwd: send.cwd,
+			resume: send.sessionId,
+			userMessageId: randomUUID(),
+			deliveryMode: 'default'
+		}
 	})
 }
 
 /**
- * Read a session's context usage. Pure read — no turn is triggered — so it's the
- * safe way to prove the socket + auth + framing work end to end.
+ * Read a session's live status — the cheapest request the socket answers, used
+ * only by the supervised probe (scripts/sidecar-probe.ts). Even a read costs the
+ * tunnel-steal hazard above; nothing in the relay calls this on its own.
  */
-export function sidecarContextUsage(sessionId: string): Promise<unknown> {
-	return rpc('contextUsage', { ...LOCAL_AUTH, sessionId }, 5000)
+export function sidecarSessionStatus(sessionId: string): Promise<unknown> {
+	return rpc('getSessionStatus', { type: 'get_session_status', id: sessionId }, 5000)
 }

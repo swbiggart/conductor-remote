@@ -145,9 +145,19 @@ export interface AgentResult {
 	error?: string
 }
 
+/** One model the picker can offer: the DB id to stage, the menu label to show. */
+export interface ModelEntry {
+	id: string
+	label: string
+}
+
 export interface ModelsResult {
 	ok: boolean
 	models?: string[]
+	/** id+label pairs from the relay's catalog; absent from a live menu read or an older relay. */
+	entries?: ModelEntry[]
+	/** 'catalog' (extracted from Conductor's binary, instant) or 'live' (the real menu was opened). */
+	source?: string
 	error?: string
 }
 

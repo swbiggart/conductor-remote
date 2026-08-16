@@ -55,6 +55,8 @@ export interface SendTarget {
 	sessionId: string | null
 	/** Which chat tab to select once the workspace is focused. Omitted → whichever tab is already active. */
 	tab?: ChatTab
+	/** `sessions.agent_type`, when the caller knows it — the sidecar path addresses the agent by it. */
+	agentType?: string | null
 }
 
 export interface Actuator {
@@ -170,6 +172,43 @@ export async function screenLocked(): Promise<boolean | null> {
 }
 
 /**
+ * Seconds since the human last touched this Mac's keyboard, mouse, or trackpad —
+ * or `null` when the probe can't say. Same permission-free JXA channel as
+ * `screenLocked` (a C call, not an Apple event), same bindFunction rule: the
+ * return here is a plain double, so only the argument types need declaring.
+ */
+export async function secondsSinceUserInput(): Promise<number | null> {
+	const jxa =
+		"ObjC.bindFunction('CGEventSourceSecondsSinceLastEventType', ['double', ['int32', 'uint32']]); String($.CGEventSourceSecondsSinceLastEventType(1, 4294967295))"
+	try {
+		const { stdout } = await exec('osascript', ['-l', 'JavaScript', '-e', jxa], { timeout: 5_000 })
+		const n = Number.parseFloat(stdout.trim())
+		return Number.isFinite(n) && n >= 0 ? n : null
+	} catch {
+		return null
+	}
+}
+
+/**
+ * Hold a UI write until the human's hands have been off the Mac for a beat.
+ * `uiTurn` serializes *our* writes against each other, but not against the
+ * person at the keyboard — and an open menu dies the moment they click (the
+ * status write's one observed failure mode is exactly that contention). Waiting
+ * a few idle seconds costs the phone little and removes most of it. Fail-open on
+ * every edge: a probe that can't answer, a locked screen (no input is coming),
+ * or the cap running out all proceed — this is a courtesy, not a gate.
+ */
+export async function waitForUserIdle(minIdleSeconds: number, capMs: number): Promise<void> {
+	const deadline = Date.now() + capMs
+	for (;;) {
+		const idle = await secondsSinceUserInput()
+		if (idle === null || idle >= minIdleSeconds) return
+		if (Date.now() >= deadline) return
+		await new Promise(resolve => setTimeout(resolve, Math.min(1000, deadline - Date.now())))
+	}
+}
+
+/**
  * The sidecar IPC path — the precise, per-session write. Delivers straight to
  * `sessionId` over Conductor's own dispatch socket (see sidecar.ts), so it needs
  * no window focus and the app UI reflects the turn correctly.
@@ -193,8 +232,16 @@ export class SidecarActuator implements Actuator {
 	async send(target: SendTarget, text: string, _deadline?: number): Promise<SendResult> {
 		const sessionId = target.sessionId ?? target.workspace.active_session_id
 		if (!sessionId) return { ok: false, strategy: this.name, error: 'no session id to target' }
+		if (!target.workspace.worktree) {
+			return { ok: false, strategy: this.name, error: 'workspace worktree could not be resolved' }
+		}
 		try {
-			await sidecarSendUserMessage(sessionId, text)
+			await sidecarSendUserMessage({
+				sessionId,
+				text,
+				cwd: target.workspace.worktree,
+				agentType: target.agentType ?? 'claude'
+			})
 			return { ok: true, strategy: this.name }
 		} catch (err) {
 			return { ok: false, strategy: this.name, error: err instanceof Error ? err.message : String(err) }
@@ -351,25 +398,35 @@ export class AppleScriptActuator implements Actuator {
 	readonly precise = true
 
 	async send(target: SendTarget, text: string, deadline = Date.now() + SEND_ATTEMPT_MS): Promise<SendResult> {
-		// Open the target workspace's own link, confirm its chat tab, fill the composer, send.
-		// Filling is an Accessibility write (no keystrokes, no clipboard); the
-		// clipboard paste is kept only as a fallback, and stashes/restores around it.
+		// Try the silent path first: when Conductor already shows the target chat, the
+		// whole send is AX reads and presses, which work on a background app — no
+		// activate, no stolen focus (see silentSend in conductor.applescript). Anything
+		// short of that falls into the activation ladder: open the workspace's own
+		// link, confirm its chat tab, fill the composer, send. Filling is an
+		// Accessibility write (no keystrokes, no clipboard); the clipboard paste is
+		// kept only as a fallback, and stashes/restores around it. The final press
+		// prefers the composer's send button and keeps Enter for a build whose button
+		// isn't AX-mapped.
 		const script = `
 ${CONDUCTOR_HANDLERS}
 
-my activateConductor()
-my focusWorkspace()
-my selectChatTab()
 set promptText to my normalizeNewlines(do shell script "cat" & " " & quoted form of (system attribute "RELAY_PROMPT_FILE"))
-if not (my fillComposer(promptText)) then
-	set savedClipboard to the clipboard
-	my pasteComposer()
-	delay 0.1
-	set the clipboard to savedClipboard
+if not (my silentSend(promptText)) then
+	my activateConductor()
+	my focusWorkspace()
+	my selectChatTab()
+	if not (my fillComposer(promptText)) then
+		set savedClipboard to the clipboard
+		my pasteComposer()
+		delay 0.1
+		set the clipboard to savedClipboard
+	end if
+	if not (my pressSendButton()) then
+		tell application "System Events"
+			key code 36
+		end tell
+	end if
 end if
-tell application "System Events"
-	key code 36
-end tell
 `.trim()
 		// Pass the prompt via a temp file + env to avoid AppleScript string escaping.
 		const os = await import('node:os')
@@ -417,6 +474,12 @@ export interface AgentOptions {
 	toggleFast?: boolean
 	/** The model picker's menu label, e.g. "Opus 5" or "Sonnet 4.6". */
 	model?: string
+	/**
+	 * The model's *id* (`sessions.model`), when the caller resolved `model` from
+	 * the catalog — lets the DB confirm the exact value instead of trusting the
+	 * menu label alone. Ignored by the UI drive itself.
+	 */
+	modelId?: string
 }
 
 /**
@@ -524,15 +587,19 @@ export const WORKSPACE_STATUS_LABELS: Record<string, string> = {
  * Move a workspace between the sidebar's status groups — the thing a merged PR
  * that Conductor never linked can't do for itself.
  *
- * Unlike every other write here this one never changes what's on screen: it
- * right-clicks the workspace's *row* (AXShowMenu) and works the menu, so the
- * workspace you were reading stays open. It does need the row to be rendered,
- * which a collapsed sidebar section prevents — that case is reported in words
- * rather than guessed around, because there is no palette command to fall back to.
+ * In the common case this never changes what's on screen: it right-clicks the
+ * workspace's *row* (AXShowMenu) and works the menu, so the workspace you were
+ * reading stays open. A row hidden by a collapsed sidebar section is no longer a
+ * dead end: `revealSidebarRow` escalates — the workspace's own deep link first
+ * (which does change the screen; failing was the alternative), then expanding
+ * the section header the row should sit under, restored afterward.
+ * RELAY_WS_GROUP carries the group to try first, from the same status the
+ * sidebar groups by.
  */
 export async function setWorkspaceStatus(workspace: Workspace, status: string): Promise<SendResult> {
 	const label = WORKSPACE_STATUS_LABELS[status]
 	if (!label) return { ok: false, strategy: 'applescript', error: `unknown status ${status}` }
+	const currentGroup = WORKSPACE_STATUS_LABELS[workspace.manual_status ?? workspace.derived_status ?? ''] ?? ''
 	const script = `
 ${CONDUCTOR_HANDLERS}
 
@@ -545,9 +612,10 @@ return "ok"`.trim()
 				env: {
 					...process.env,
 					...targetEnv({ workspace, sessionId: null }),
-					RELAY_SET_STATUS: label
+					RELAY_SET_STATUS: label,
+					RELAY_WS_GROUP: currentGroup
 				},
-				timeout: 25000
+				timeout: 35000
 			})
 		)
 		return { ok: true, strategy: 'applescript' }

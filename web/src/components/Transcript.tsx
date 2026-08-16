@@ -348,6 +348,18 @@ function Entry({ e }: { e: TranscriptEntry }) {
 		)
 	}
 	if (e.role === 'system') {
+		// An error notice gets Conductor's own treatment — the bordered mono
+		// capsule ("INTERRUPTED BY USER") — while unknown-frame raw dumps keep
+		// the dim centered line, so Conductor drift stays visible as itself.
+		if (e.error) {
+			return (
+				<div className="px-0.5 py-1">
+					<span className="inline-block rounded-lg border border-border px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider text-muted">
+						{e.text}
+					</span>
+				</div>
+			)
+		}
 		return <div className="px-2 text-center text-[11px] text-faint">{e.text}</div>
 	}
 	// assistant

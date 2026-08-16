@@ -193,8 +193,10 @@ export const useApp = create<AppState>((set, get) => {
 			set({ agentDrafts: { ...get().agentDrafts, [sessionId]: next } })
 		},
 		// Drafts persist in localStorage, so a value changed on the Mac (or never sent)
-		// would otherwise keep the pill "staged" forever. Model is exempt: staged models
-		// are menu labels with no mapping to the DB's model ids (see AgentBar).
+		// would otherwise keep the pill "staged" forever. Staged models are ids now
+		// (AgentBar stages through the catalog's id↔label map), so they reconcile like
+		// the rest; a legacy label draft never equals the DB's id and simply persists
+		// until sent, exactly as before.
 		reconcileAgentDrafts: sessions => {
 			const drafts = get().agentDrafts
 			let changed = false
@@ -203,7 +205,7 @@ export const useApp = create<AppState>((set, get) => {
 				const d = drafts[s.id]
 				if (!d) continue
 				const pruned = prunePatch({
-					model: d.model,
+					model: d.model === (s.model ?? undefined) ? undefined : d.model,
 					effort: d.effort === (s.claude_effort_level ?? undefined) ? undefined : d.effort,
 					plan: d.plan === (s.permission_mode === 'plan') ? undefined : d.plan,
 					fast: d.fast === Boolean(s.fast_mode) ? undefined : d.fast

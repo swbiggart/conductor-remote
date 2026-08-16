@@ -242,9 +242,23 @@ Two asymmetric halves — keep them separate:
        count + label and a tie aborts, so we never type into a terminal.
     4. **Composer** — `AXGroup "composer"` holds an `AXTextArea` whose `AXFocused`
        and `AXValue` are both settable, so the prompt is *written*, read back to
-       verify, then Enter. No clipboard hijack, no Cmd+L/Cmd+V. Clipboard paste
-       survives only as a fallback — and `fillComposer` **clears whatever it wrote
-       before falling back**, or the paste appends and sends a garbled prompt.
+       verify, then sent — preferring an `AXPress` on the composer's own send
+       button (`pressSendButton`: only a *unique* button whose name says send) and
+       keeping Enter for a build whose button isn't AX-mapped. No clipboard
+       hijack, no Cmd+L/Cmd+V. Clipboard paste survives only as a fallback — and
+       `fillComposer` **clears whatever it wrote before falling back**, or the
+       paste appends and sends a garbled prompt.
+
+    **The whole ladder is also skippable** (`silentSend`): AX reads, sets and
+    presses work on a *background* app, so when Conductor already shows the target
+    chat — the common case, checked with the same pane assertion — the send runs
+    with no `activate` at all: no stolen focus, the human keeps typing wherever
+    they were. Anything short of that (no window, which is also the locked and
+    full-screen-Space case; wrong pane; no send button) returns false and the
+    activation ladder takes over, so the fast path can only ever save disruption.
+    Queue deliveries additionally wait for idle hands (`waitForUserIdle` — a
+    background send should never fight the human for the UI), as does the status
+    write; a phone-initiated send stays immediate.
 
     Landing in the wrong agent is worse than not sending, so every step errors out
     rather than guessing. No private protocol, nothing to rebreak on a Conductor
@@ -282,11 +296,22 @@ Two asymmetric halves — keep them separate:
     and which *cycles* (Low → Medium → High → Extra high → Max → Ultracode → wrap),
     so we press until the label matches; Plan is an `AXCheckBox` with readable
     state; the model picker is an `AXMenu` (labels carry badges — "Opus 5 NEW" —
-    so matching prefers exact then unique-prefix, and `GET …/models` enumerates it
-    live rather than hard-coding a list that would rot). **Fast has no readable
-    state and only exists for some models**, so the DB decides whether to press it
-    and a missing button is reported, not ignored. Every change is confirmed
-    against the DB before the API returns success.
+    so matching runs exact → wanted-plus-badge-words-only → unique-prefix, and a
+    tie still refuses). **The model *list* never opens that menu anymore**: it is
+    extracted from conductor-runtime's own bundled wire schema
+    (`src/modelcatalog.ts` — one literal-union of ids per agent family, classified
+    by content, never by minified names), cached keyed on the binary's identity so
+    a Conductor update invalidates it by existing. Ids become labels mechanically
+    (`opus-4-8-1m` → "Opus 4.8 1M"), the API serves both (`entries` — additive, a
+    stale PWA keeps reading `models`), and a model change resolved from the
+    catalog is confirmed against `sessions.model` *by id* — stricter than the
+    label echo. The catalog is a superset (the wire accepts entries the menu may
+    hide for a plan), so a `setModel` miss on a catalog label **invalidates the
+    catalog** and the endpoint's live fallback (`?refresh=1`, also the picker's
+    manual-refresh row and the path for `acp` chats) takes over. **Fast has no
+    readable state and only exists for some models**, so the DB decides whether to
+    press it and a missing button is reported, not ignored. Every change is
+    confirmed against the DB before the API returns success.
 
     **The phone doesn't push these on tap — the send does.** A tap only *stages*
     the change (`web/src/lib/agentDraft.ts`, keyed by session id and persisted
@@ -305,21 +330,32 @@ Two asymmetric halves — keep them separate:
     stages for the next one instead of being swallowed), and a staged value the DB
     has caught up with is dropped on the sessions poll (`reconcileAgentDrafts`) —
     drafts persist in localStorage, so without that a value changed on the Mac
-    would keep the pill "staged" forever. `GET …/models` is then the only
-    tap-time trip left, and it's the expensive one — it activates Conductor and
-    opens the real menu — so its result is cached per `agent_type` and served
-    stale-while-revalidate (`web/src/lib/models.ts` ▸ `useModels`): the picker
-    paints from the last list and refreshes behind it, and a refresh that fails
-    keeps that list on screen and says so rather than emptying it.
+    would keep the pill "staged" forever. The picker stages model *ids* through
+    the cached id↔label map (`web/src/lib/models.ts`), which is what makes model
+    drafts reconcilable against `sessions.model` like every other key (a legacy
+    label draft never equals an id and simply persists until sent). With the
+    catalog serving the list, no tap-time trip is expensive anymore; the one
+    deliberately expensive tap left is the picker's "Refresh from Conductor" row
+    (`?refresh=1`), which opens the real menu, and a refresh that fails keeps the
+    cached list on screen and says so rather than emptying it.
 
     **Workspace status** (`setWorkspaceStatus`, `POST /api/workspaces/:id/status`)
-    is the one write that touches no pane at all — it right-clicks the workspace's
-    *sidebar row* (`AXShowMenu`), so what's on screen never changes. Conductor
-    offers this nowhere else: **the menu bar has no status command and the palette
-    has none either**, so the row menu (Mark as unread · Pin · Set status · Rename
-    · Copy link · Archive) is the only lever, and a collapsed sidebar section —
-    which hides the row from Accessibility entirely — is reported rather than
-    worked around, because there is no fallback to fall back to. Three things bite:
+    is the one write that touches no pane in the common case — it right-clicks the
+    workspace's *sidebar row* (`AXShowMenu`), so what's on screen doesn't change.
+    Conductor offers this nowhere else: **the menu bar has no status command and
+    the palette has none either**, so the row menu (Mark as unread · Pin · Set
+    status · Rename · Copy link · Archive) is the only lever. A collapsed sidebar
+    section — which hides the row from Accessibility entirely — is no longer a
+    dead end: `revealSidebarRow` escalates, cheapest first — the workspace's own
+    deep link (which *does* change the screen; failing was the alternative), then
+    pressing the section header the row should sit under (`RELAY_WS_GROUP`, the
+    label of `manual_status ?? derived_status`, tried before the other groups). A
+    header press that doesn't produce the row is undone on the spot, and
+    `restoreExpandedSections` collapses what the run opened, success or failure —
+    a phone action must not rearrange a sidebar someone deliberately folded. The
+    route also waits briefly for idle hands first (`waitForUserIdle`, fail-open):
+    contention with the human's clicks was this write's one observed failure mode.
+    Three things bite:
     the row must be **scrolled into view** (`AXScrollToVisible`) or `AXShowMenu`
     succeeds and draws nothing, which is exactly what happens right after a status
     change moves the row to a different group; the submenu opens **nested inside
@@ -338,14 +374,24 @@ Two asymmetric halves — keep them separate:
     while you are using the Mac is contention, not a bug. Uncontended it is 6/6 at
     ~11s; typing in Conductor at the same time made it look flaky.
   - `sidecar` (opt-in, `WRITE_STRATEGY=sidecar`): JSON-RPC over Conductor's unix
-    socket, addresses a session by id. Precise in principle but speaks a private
-    `-v2-` protocol — the most update-fragile surface here, and **currently
-    non-functional against Conductor 0.76**: the `query` schema drifted and idle
-    sessions aren't live in the sidecar (they need a session-resume handshake), so
-    the shipped payload fails loud (`ok:false`). Don't half-fix the schema — a
-    `type:"query"` payload *validates then silently drops* the prompt. **A live
+    socket, addresses a session by id. Re-derived against 0.81 (see src/sidecar.ts):
+    the socket verb is `query` with `{type:'query', id:<sessionId>, agentType,
+    message, prompt, options:{cwd, resume, …}}` — the shape the relay now ships;
+    the `sendUserMessageRequest` shape it used to send belongs to the child bridge
+    one layer down and never was reachable from the socket. **The socket is
+    single-client by design**: every connection (even a probe) displaces the
+    desktop app's event tunnel, and closing ours leaves the slot empty until the
+    app reattaches — events persist to an acked outbox, but live streaming stalls
+    for an unmeasured recovery window. So nothing connects casually; the one
+    scoped use is `SIDECAR_WHEN_LOCKED=1`, which lets the parked queue try one
+    sidecar delivery per text-only entry *behind the lock screen* (where
+    AppleScript is structurally dead and nobody watches the desktop), confirmed
+    against the transcript like every send — and it stays off until the
+    supervised tunnel-recovery probe (`scripts/sidecar-probe.ts`, run by a human
+    watching a streaming agent) shows the app reattaches on its own. **A live
     `query` send injects a real prompt into a running agent; never auto-run it to
-    "test."** Since `applescript` is now precise, sidecar buys nothing today.
+    "test."** Since `applescript` is precise and the tunnel hazard is real,
+    sidecar stays off the default path; the locked Mac is its one honest niche.
 
 - **"Waiting on you" is a read, not a signal** (`reads.pendingInput`). The schema
   has no waiting flag, but an *idle* session whose transcript tail is an

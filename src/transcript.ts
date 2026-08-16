@@ -36,6 +36,14 @@ export interface TranscriptEntry {
 	ts: string
 	/** True when the message is queued but not yet sent (queue_order set, sent_at null). */
 	queued: boolean
+	/** Files the user attached on the Mac, parsed out of Conductor's `@⟦name⟧(path)` markup. */
+	attachments?: AttachmentRef[]
+}
+
+/** One attachment reference: display name + worktree-relative path on disk. */
+export interface AttachmentRef {
+	name: string
+	path: string
 }
 
 export interface QuestionOption {
@@ -158,6 +166,33 @@ function resultText(content: unknown): string {
 	return clip(s.replace(/<\/?tool_use_error>/g, '').trim(), 400)
 }
 
+/**
+ * Conductor's attachment references — `@⟦name⟧(percent-encoded path)` — are
+ * markup the Mac renders as chips and a phone must not show raw. The bubble
+ * text keeps a plain `📎 name` marker; the parsed name + worktree-relative path
+ * ride along as an additive field (a stale client just shows the clean text),
+ * so a client can grow real thumbnails later — the files live on disk under the
+ * worktree's `.context/attachments/`.
+ */
+const ATTACHMENT_REF = /@⟦([^⟧]*)⟧\(([^)]*)\)/g
+
+function parseAttachmentRefs(content: string): { text: string; attachments?: AttachmentRef[] } {
+	const attachments: AttachmentRef[] = []
+	const text = content
+		.replace(ATTACHMENT_REF, (_, name: string, encoded: string) => {
+			let path = encoded
+			try {
+				path = decodeURIComponent(encoded)
+			} catch {}
+			attachments.push({ name, path })
+			// Plain text, no emoji: iOS renders unsupported glyphs as tofu, and
+			// clients that read `attachments` will replace this with a real chip.
+			return `(${name})`
+		})
+		.trim()
+	return attachments.length ? { text, attachments } : { text: content }
+}
+
 export function parseMessage(row: RawRow, worktree: string | null = null): TranscriptEntry[] {
 	const queued = row.queue_order !== null && row.sent_at === null
 	const base = { rowid: row.rowid, ts: row.created_at, queued }
@@ -166,7 +201,7 @@ export function parseMessage(row: RawRow, worktree: string | null = null): Trans
 	// Plain user prompt (not SDK JSON) — the only source of real user bubbles.
 	if (!content.startsWith('{')) {
 		if (!content.trim()) return []
-		return [{ ...base, id: row.id, role: 'user', text: content }]
+		return [{ ...base, id: row.id, role: 'user', ...parseAttachmentRefs(content) }]
 	}
 
 	let parsed: { type?: string; subtype?: string; message?: { content?: SdkBlock[] } }
@@ -178,6 +213,25 @@ export function parseMessage(row: RawRow, worktree: string | null = null): Trans
 
 	// Bookkeeping frames: hooks, init, token accounting, end-of-turn results.
 	if (parsed.type === 'system' || parsed.type === 'result') return []
+
+	// Turn-level error rows — Conductor renders these as its bordered capsule
+	// ("INTERRUPTED BY USER"), and by far the most common is the user pressing
+	// Stop. Surface the human content with Conductor's own wording for the known
+	// phrase, and set `error` so clients style it as a notice; the raw-dump
+	// fallback below stays reserved for frames we *don't* understand.
+	if (parsed.type === 'error') {
+		const detail = (parsed as { content?: unknown }).content
+		const text = typeof detail === 'string' && detail.trim() ? detail.trim() : clip(content, 200)
+		return [
+			{
+				...base,
+				id: row.id,
+				role: 'system',
+				error: true,
+				text: text === 'aborted by user' ? 'Interrupted by user' : clip(text, 300)
+			}
+		]
+	}
 
 	const blocks = parsed.message?.content
 	if (!Array.isArray(blocks)) {

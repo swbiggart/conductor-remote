@@ -20,10 +20,12 @@ import {
 	tailLogFile
 } from './logbuf.ts'
 import { mergePr } from './merge.ts'
+import { catalogEntry, invalidateModelCatalog, type ModelFamily, modelCatalog } from './modelcatalog.ts'
 import { notifyAll, notifyDevice, pushConfig, startNotifier, subscribeDevice, unsubscribeDevice } from './notify.ts'
 import { type ParkedAgentPatch, type ParkedPrompt, ParkedPromptQueue } from './parked.ts'
 import { attachPrStatus } from './pr.ts'
 import { Reads, type SessionRow, type Workspace } from './reads.ts'
+import { sidecarSendUserMessage } from './sidecar.ts'
 import { driftWarningLines, tailscaleBin } from './tailscale.ts'
 import {
 	type AgentOptions,
@@ -42,7 +44,8 @@ import {
 	setAgentOptions,
 	setRestartGuard,
 	setWorkspaceStatus,
-	WORKSPACE_STATUS_LABELS
+	WORKSPACE_STATUS_LABELS,
+	waitForUserIdle
 } from './writes.ts'
 
 // Before anything that logs: from here on every console line is also kept in memory for
@@ -168,7 +171,11 @@ async function confirmAgentOptions(ws: Workspace, sessionId: string, opts: Agent
 		// turn a third spelling into a permanent 502.
 		const planOk =
 			opts.plan === undefined || (opts.plan ? s?.permission_mode === 'plan' : s?.permission_mode !== 'plan')
-		if (effortOk && planOk) return true
+		// A catalog-resolved model change is confirmed by *id*, the exact value the
+		// menu press was supposed to produce — stricter than the label echo the
+		// AppleScript checks, and immune to badge wording.
+		const modelOk = !opts.modelId || s?.model === opts.modelId
+		if (effortOk && planOk && modelOk) return true
 		await sleep(300)
 	}
 	return false
@@ -220,7 +227,11 @@ async function deliverPrompt(
 		// write, and only the run knows what was left of the budget when it started. Minus
 		// the confirm, so a caller on a tight budget spends it on the run rather than on
 		// watching — a 25s-era phone gets one full-length attempt, not two too short to finish.
-		last = await actuator.send({ workspace: ws, sessionId, tab: located.tab }, text, deadline - MIN_CONFIRM_MS)
+		last = await actuator.send(
+			{ workspace: ws, sessionId, tab: located.tab, agentType: located.session?.agent_type },
+			text,
+			deadline - MIN_CONFIRM_MS
+		)
 		if (await confirmDelivery(sessionId, text, beforeRowid, deadline)) {
 			if (attempts > 1) console.info(`[relay] send to ${label} landed on attempt ${attempts}`)
 			return { ok: true, strategy: last.strategy, attempts }
@@ -266,6 +277,10 @@ const firstPrompts = new FirstPromptQueue(path.join(stateDir(), 'first-prompts.j
 	send: async (workspaceId, sessionId, text) => {
 		const ws = reads.getWorkspace(workspaceId)
 		if (!ws) return { ok: false, error: 'the workspace is gone' }
+		// Queue deliveries run on their own schedule with nobody waiting, so give the
+		// human at the Mac right of way — contention with their typing is the one
+		// cost a background send can always avoid.
+		await waitForUserIdle(5, 45_000)
 		const result = await deliverPrompt(ws, sessionId, text)
 		return { ok: result.ok, error: result.error, blocked: lockBlocked(result.error) }
 	},
@@ -286,14 +301,25 @@ async function applyAgentPatch(
 ): Promise<{ ok: boolean; error?: string }> {
 	const located = locateChat(ws, sessionId)
 	if ('error' in located) return { ok: false, error: located.error }
+	// `model` arrives as an id from clients that use the catalog and as a menu
+	// label from older ones; the id form resolves to the label the menu is pressed
+	// toward and to the exact DB value the confirm below checks.
+	const entry = patch.model ? catalogEntry(located.session?.agent_type ?? null, patch.model) : null
 	const opts: AgentOptions = {
 		effort: patch.effort,
 		plan: patch.plan,
-		model: patch.model,
+		model: entry?.label ?? patch.model,
+		modelId: entry?.id,
 		toggleFast: patch.fast === undefined ? false : patch.fast !== Boolean(located.session?.fast_mode)
 	}
 	const result = await setAgentOptions({ workspace: ws, sessionId, tab: located.tab }, opts)
-	if (!result.ok) return { ok: false, error: result.error }
+	if (!result.ok) {
+		// A catalog-derived label the live menu doesn't offer means the catalog and
+		// the menu disagree (an account-gated entry, or a label worded differently) —
+		// drop the catalog so the next model list is re-extracted or read live.
+		if (entry && /no model named|several models match/.test(result.error ?? '')) invalidateModelCatalog()
+		return { ok: false, error: result.error }
+	}
 	if (!(await confirmAgentOptions(ws, sessionId, opts))) {
 		return { ok: false, error: 'Conductor didn’t record the change — it may have been asleep. Try again.' }
 	}
@@ -312,6 +338,8 @@ const parkedPrompts = new ParkedPromptQueue(path.join(stateDir(), 'parked-prompt
 	deliver: async entry => {
 		const ws = reads.getWorkspace(entry.workspaceId)
 		if (!ws) return { ok: false, error: 'the workspace is gone' }
+		// The user just unlocked the Mac — don't fight their first clicks for the UI.
+		await waitForUserIdle(5, 45_000)
 		// Settings first, prompt only if they stuck — the same order and the same
 		// fail-closed rule as the phone's own send (running the prompt on the model
 		// the user moved away from is the mistake this exists to prevent). A re-run
@@ -324,6 +352,38 @@ const parkedPrompts = new ParkedPromptQueue(path.join(stateDir(), 'parked-prompt
 		const result = await deliverPrompt(ws, entry.sessionId, entry.text)
 		return { ok: result.ok, error: result.error, blocked: lockBlocked(result.error) }
 	},
+	// Opt-in (SIDECAR_WHEN_LOCKED=1, see CLAUDE.md): while the Mac is locked —
+	// where AppleScript is structurally dead and nobody is watching the desktop —
+	// try one sidecar delivery per entry over Conductor's own dispatch socket.
+	// Only text-only entries: staged settings need the UI, so they wait for the
+	// unlock as before. The transcript is the receipt here exactly as for a UI
+	// send: the sidecar's RPC returns void and reports failures out-of-band, so
+	// `confirmDelivery` against the DB is the only signal trusted. Gated on the
+	// supervised tunnel-recovery experiment (scripts/sidecar-probe.ts) because
+	// every socket connection displaces the app's own event tunnel.
+	deliverLocked:
+		process.env.SIDECAR_WHEN_LOCKED === '1'
+			? async entry => {
+					if (entry.agent) return { ok: false, error: 'staged settings need the unlocked UI' }
+					const ws = reads.getWorkspace(entry.workspaceId)
+					if (!ws?.worktree) return { ok: false, error: 'workspace worktree could not be resolved' }
+					const located = locateChat(ws, entry.sessionId)
+					if ('error' in located) return { ok: false, error: located.error }
+					const before = reads.getMessages(entry.sessionId).cursor
+					try {
+						await sidecarSendUserMessage({
+							sessionId: entry.sessionId,
+							text: entry.text,
+							cwd: ws.worktree,
+							agentType: located.session?.agent_type ?? 'claude'
+						})
+					} catch (err) {
+						return { ok: false, error: err instanceof Error ? err.message : String(err) }
+					}
+					const landed = await confirmDelivery(entry.sessionId, entry.text, before, Date.now() + 15_000)
+					return landed ? { ok: true } : { ok: false, error: 'the sidecar accepted the send but no user row appeared' }
+				}
+			: undefined,
 	notify: (entry: ParkedPrompt, error?: string) => {
 		const ws = reads.getWorkspace(entry.workspaceId)
 		const title = ws?.workspace_name ?? ws?.pr_title ?? ws?.branch ?? 'Conductor'
@@ -666,6 +726,10 @@ const server = http.createServer(async (req, res) => {
 			}
 			const ws = reads.getWorkspace(workspaceId)
 			if (!ws) return json(req, res, 404, { error: 'workspace not found' })
+			// The one observed failure mode of this write is contention: the row menu
+			// dies the moment the human clicks elsewhere. A status change isn't urgent
+			// the way a send is, so wait briefly for idle hands (fail-open, capped).
+			await waitForUserIdle(3, 10_000)
 			const result = await setWorkspaceStatus(ws, status)
 			if (!result.ok) return json(req, res, 502, result)
 			// The menu press lands in the DB a beat later. Confirm rather than assume —
@@ -700,7 +764,15 @@ const server = http.createServer(async (req, res) => {
 			})
 		}
 
-		// GET /api/sessions/:id/models?workspaceId= — labels from Conductor's live picker
+		// GET /api/sessions/:id/models?workspaceId=[&refresh=1] — the models this chat's
+		// agent family offers. Served from the catalog extracted out of Conductor's own
+		// runtime binary (src/modelcatalog.ts): no Accessibility, no stolen focus, can't
+		// go stale (the binary is the installed version's truth, and an update
+		// invalidates the cache by changing it). `refresh=1` — the picker's manual
+		// refresh — is the one path that still opens the live menu, and it's also the
+		// fallback whenever the catalog can't answer (an `acp` chat, an unparseable
+		// binary). `models` stays a plain label list for older clients; `entries`
+		// carries the ids new clients stage (additive — a stale PWA ignores it).
 		m = pathname.match(/^\/api\/sessions\/([^/]+)\/models$/)
 		if (req.method === 'GET' && m) {
 			const sessionId = decodeURIComponent(m[1])
@@ -708,8 +780,23 @@ const server = http.createServer(async (req, res) => {
 			if (!ws) return json(req, res, 404, { error: 'workspace for session not found' })
 			const located = locateChat(ws, sessionId)
 			if ('error' in located) return json(req, res, 409, { error: located.error })
+			const refresh = url.searchParams.get('refresh') === '1'
+			if (!refresh) {
+				const family = (located.session?.agent_type ?? 'claude') as ModelFamily
+				const catalog = modelCatalog()
+				const entries = catalog?.families[family]
+				if (entries?.length) {
+					return json(req, res, 200, {
+						ok: true,
+						models: entries.map(e => e.label),
+						entries,
+						source: 'catalog',
+						conductor_version: catalog?.conductorVersion ?? null
+					})
+				}
+			}
 			const result = await listAgentModels({ workspace: ws, sessionId, tab: located.tab })
-			return json(req, res, result.ok ? 200 : 502, result)
+			return json(req, res, result.ok ? 200 : 502, { ...result, source: 'live' })
 		}
 
 		// POST /api/sessions/:id/agent  { effort?, plan?, fast?, model? }
