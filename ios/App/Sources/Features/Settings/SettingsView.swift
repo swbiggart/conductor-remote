@@ -31,6 +31,18 @@ struct SettingsView: View {
 					}
 				}
 
+				Section {
+					Toggle(
+						"Show steps while working",
+						isOn: Binding(get: { model.liveSteps }, set: { model.setLiveSteps($0) }))
+				} header: {
+					Text("Transcript")
+				} footer: {
+					Text(
+						"On: the working turn's steps stream as individual rows, like the Mac app. Off: they stay collapsed into a live-updating \"N steps\" group until the turn ends."
+					)
+				}
+
 				Section("Notifications") {
 					// Phase 5 (APNs) lands here. Stated honestly until then.
 					Text(

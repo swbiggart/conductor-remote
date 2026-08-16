@@ -41,6 +41,8 @@ public final class AppModel {
 	/// Conductor's own `active_session_id` tracks whatever the Mac has open (which
 	/// can be a hidden chat with no tab at all) and makes a poor default here.
 	@ObservationIgnored private var lastViewedChat: [String: String]
+	/// Settings ▸ stream the working turn's steps unfolded (default collapsed).
+	public private(set) var liveSteps: Bool
 
 	// MARK: Client-owned state
 
@@ -57,6 +59,7 @@ public final class AppModel {
 	private static let readMarksKey = "conductor-remote-read"
 	private static let snapshotKey = "conductor-remote-state-snapshot"
 	private static let lastViewedKey = "conductor-remote-last-viewed-chat"
+	private static let liveStepsKey = "conductor-remote-live-steps"
 
 	/// Bumped when a workspace's turn verifiably ends (working → idle held for
 	/// one more tick — same flap guard as the relay's push watcher). The UI
@@ -78,6 +81,7 @@ public final class AppModel {
 		self.modelCache = ModelCache(store: keyValueStore)
 		self.readMarks = ReadMarks(marks: keyValueStore.decode([String: String].self, forKey: Self.readMarksKey) ?? [:])
 		self.lastViewedChat = keyValueStore.decode([String: String].self, forKey: Self.lastViewedKey) ?? [:]
+		self.liveSteps = keyValueStore.decode(Bool.self, forKey: Self.liveStepsKey) ?? false
 		self.sends = SendPipeline(client: client, drafts: drafts, agentDrafts: agentDrafts)
 		// Cold launch paints from the last known state instantly (Flighty
 		// rule: never a spinner over a list we already know).
@@ -216,8 +220,18 @@ public final class AppModel {
 	public func transcript(sessionID: String) -> TranscriptModel {
 		if let existing = transcripts[sessionID] { return existing }
 		let model = TranscriptModel(sessionID: sessionID)
+		model.setLiveSteps(liveSteps)
 		transcripts[sessionID] = model
 		return model
+	}
+
+	/// Settings toggle: stream or collapse the working turn's steps. Applies to
+	/// every cached transcript immediately — the open chat refolds in place.
+	public func setLiveSteps(_ enabled: Bool) {
+		guard enabled != liveSteps else { return }
+		liveSteps = enabled
+		keyValueStore.encode(enabled, forKey: Self.liveStepsKey)
+		for model in transcripts.values { model.setLiveSteps(enabled) }
 	}
 
 	/// The chat this phone last viewed in a workspace, if it's still one of the

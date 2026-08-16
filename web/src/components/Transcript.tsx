@@ -29,6 +29,7 @@ export function Transcript({
 	queued?: PendingPrompt | null
 }) {
 	const { entries, pending: inputPending, loading, error } = useTranscript(sessionId)
+	const liveSteps = useApp(s => s.view.liveSteps)
 	const pending = useApp(s => s.pending)
 	const removePending = useApp(s => s.removePending)
 	const sendPrompt = useSendPrompt()
@@ -114,7 +115,7 @@ export function Transcript({
 					<Empty>No messages yet.</Empty>
 				) : (
 					<div className="flex min-w-0 flex-col gap-2.5">
-						{buildRows(entries, working ?? false).map(row =>
+						{buildRows(entries, working ?? false, liveSteps).map(row =>
 							row.kind === 'steps' ? (
 								<StepGroup key={row.key} entries={row.entries} sessionId={sessionId} />
 							) : row.kind === 'turn' ? (
@@ -212,10 +213,11 @@ function groupSteps(entries: TranscriptEntry[], unfoldTrailing = false): Row[] {
  * The full row stream: entries segmented into turns (`turnId`, NULL on
  * pre-May-2026 rows — those merge into one summary-less span), steps folded per
  * turn, and a Mac-style summary row — duration plus per-file `+N −M` chips —
- * after each *completed* turn that edited files. The trailing turn gets its
- * summary (and its fold) only once the agent stops working.
+ * after each *completed* turn that edited files. The trailing turn's summary
+ * always waits for the turn to end; whether its steps stream unfolded meanwhile
+ * is the `liveSteps` setting (Connect sheet, collapsed by default).
  */
-function buildRows(entries: TranscriptEntry[], working: boolean): Row[] {
+function buildRows(entries: TranscriptEntry[], working: boolean, liveSteps = false): Row[] {
 	const turns: TranscriptEntry[][] = []
 	let lastTurnId: string | undefined
 	for (const e of entries) {
@@ -226,7 +228,7 @@ function buildRows(entries: TranscriptEntry[], working: boolean): Row[] {
 	const rows: Row[] = []
 	turns.forEach((turn, i) => {
 		const trailing = i === turns.length - 1
-		rows.push(...groupSteps(turn, trailing && working))
+		rows.push(...groupSteps(turn, trailing && working && liveSteps))
 		if (trailing && working) return
 		const summary = turnSummary(turn)
 		if (summary) rows.push(summary)

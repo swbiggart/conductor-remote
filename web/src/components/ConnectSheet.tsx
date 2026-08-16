@@ -1,4 +1,4 @@
-import { Bell, Check, Copy, LogOut, X } from 'lucide-react'
+import { Bell, Check, Copy, ListTree, LogOut, X } from 'lucide-react'
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { usePush } from '../hooks.ts'
@@ -92,6 +92,7 @@ export function ConnectSheet({
 					{copied ? 'Copied' : 'Copy link'}
 				</button>
 				<NotificationsRow />
+				<LiveStepsRow />
 				<div className="flex w-full items-center justify-between text-xs text-faint">
 					<span className="font-mono">
 						{version ? `relay v${version}` : 'relay v?'}
@@ -119,6 +120,45 @@ export function ConnectSheet({
  * "you denied it once, so the browser will never ask again" — neither of which a
  * greyed-out switch would explain.
  */
+/** Stream the working turn's steps as individual rows (Mac-style) or keep them folded. */
+function LiveStepsRow() {
+	const liveSteps = useApp(s => s.view.liveSteps)
+	const setView = useApp(s => s.setView)
+	return (
+		<div className="w-full rounded-xl border border-border bg-surface-2 px-3 py-2.5">
+			<div className="flex items-center justify-between gap-3">
+				<div className="flex min-w-0 items-center gap-2 text-sm">
+					<ListTree size={16} className={cn('shrink-0', liveSteps ? 'text-accent' : 'text-muted')} />
+					<span>Show steps while working</span>
+				</div>
+				<button
+					type="button"
+					role="switch"
+					aria-checked={liveSteps}
+					aria-label="Show steps while working"
+					onClick={() => setView({ liveSteps: !liveSteps })}
+					className={cn(
+						'relative h-6 w-11 shrink-0 rounded-full transition-colors',
+						liveSteps ? 'bg-accent' : 'border border-border bg-surface'
+					)}
+				>
+					<span
+						className={cn(
+							'absolute left-0.5 top-0.5 size-5 rounded-full bg-white transition-transform',
+							liveSteps ? 'translate-x-5' : 'translate-x-0'
+						)}
+					/>
+				</button>
+			</div>
+			<p className="mt-1 text-xs text-muted">
+				{liveSteps
+					? 'The working turn’s steps stream as individual rows, like the Mac app.'
+					: 'The working turn’s steps stay collapsed into a live-updating group until the turn ends.'}
+			</p>
+		</div>
+	)
+}
+
 function NotificationsRow() {
 	const push = usePush()
 	const blocked = push.permission === 'denied'

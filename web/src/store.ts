@@ -15,10 +15,12 @@ export interface ViewPrefs {
 	sortBy: SortBy
 	/** Collapsed group keys (e.g. 'status:done', 'repo:auk-store'). */
 	collapsed: string[]
+	/** Stream the working turn's steps as individual rows (Mac-style); off = keep them folded. */
+	liveSteps: boolean
 }
 
 const VIEW_KEY = 'conductor-remote-view'
-const defaultView: ViewPrefs = { groupBy: 'status', repo: null, sortBy: 'updated', collapsed: [] }
+const defaultView: ViewPrefs = { groupBy: 'status', repo: null, sortBy: 'updated', collapsed: [], liveSteps: false }
 
 /**
  * A prompt shown optimistically in the transcript before the relay confirms it.

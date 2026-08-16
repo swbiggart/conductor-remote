@@ -58,12 +58,15 @@ public struct StepGroup: Sendable, Equatable, Identifiable {
 }
 
 public enum TranscriptGrouping {
-	/// `trailingTurnActive` = the agent is working: the final run of steps stays
-	/// as individual live rows (the Mac's behaviour) and the trailing turn gets
-	/// no summary yet — both appear when the turn ends. Interior groups keep
-	/// their identity (first row's key) either way, so the eventual collapse
-	/// can't lose expansion state elsewhere.
-	public static func fold(_ entries: [TranscriptEntry], trailingTurnActive: Bool = false) -> [TranscriptItem] {
+	/// `trailingTurnActive` = the agent is working: the trailing turn gets no
+	/// summary yet (it appears when the turn ends), and — when `liveSteps` is
+	/// also on — the final run of steps stays as individual live rows (the
+	/// Mac's behaviour; a Settings toggle, collapsed by default). Interior
+	/// groups keep their identity (first row's key) either way, so the eventual
+	/// collapse can't lose expansion state elsewhere.
+	public static func fold(
+		_ entries: [TranscriptEntry], trailingTurnActive: Bool = false, liveSteps: Bool = true
+	) -> [TranscriptItem] {
 		// Segment into turns first (turnId is NULL on pre-May-2026 rows — those
 		// merge into one span that simply never gets a summary).
 		var turns: [[TranscriptEntry]] = []
@@ -78,7 +81,7 @@ public enum TranscriptGrouping {
 		var items: [TranscriptItem] = []
 		for (index, turn) in turns.enumerated() {
 			let trailing = index == turns.count - 1
-			items.append(contentsOf: foldTurn(turn, unfoldTrailingRun: trailing && trailingTurnActive))
+			items.append(contentsOf: foldTurn(turn, unfoldTrailingRun: trailing && trailingTurnActive && liveSteps))
 			if trailing && trailingTurnActive { continue }
 			if let summary = summarize(turn) { items.append(.turnSummary(summary)) }
 		}

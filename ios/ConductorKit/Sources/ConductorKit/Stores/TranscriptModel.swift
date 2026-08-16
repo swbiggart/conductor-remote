@@ -26,10 +26,14 @@ public final class TranscriptModel {
 		self.sessionID = sessionID
 	}
 
-	/// Whether the trailing turn is live — while true the fold keeps the final
-	/// run of steps as individual rows and withholds its summary (the Mac's
-	/// behaviour). Set from the session's working status by the ticks.
+	/// Whether the trailing turn is live — while true the fold withholds its
+	/// summary, and (with `liveSteps` on) keeps the final run of steps as
+	/// individual rows. Set from the session's working status by the ticks.
 	private var trailingTurnActive = false
+	/// The Settings toggle: stream the live run unfolded, or keep it collapsed
+	/// like every other run. Product default is collapsed; AppModel pushes the
+	/// persisted choice in.
+	private var liveSteps = false
 
 	/// Returns the trimmed texts of newly-arrived user rows so the send
 	/// pipeline can retire matching optimistic bubbles.
@@ -44,7 +48,7 @@ public final class TranscriptModel {
 		// nothing, and group identity is stable (first row's key) so SwiftUI
 		// keeps expansion state. Don't add incremental merge complexity until
 		// a profile demands it.
-		items = TranscriptGrouping.fold(entries, trailingTurnActive: self.trailingTurnActive)
+		refold()
 		return response.entries.filter { $0.role == .user }.map(\.text)
 	}
 
@@ -54,6 +58,17 @@ public final class TranscriptModel {
 	public func setTrailingTurnActive(_ active: Bool) {
 		guard active != trailingTurnActive else { return }
 		trailingTurnActive = active
-		items = TranscriptGrouping.fold(entries, trailingTurnActive: active)
+		refold()
+	}
+
+	/// The Settings toggle changed (or a fresh model needs the persisted value).
+	public func setLiveSteps(_ enabled: Bool) {
+		guard enabled != liveSteps else { return }
+		liveSteps = enabled
+		refold()
+	}
+
+	private func refold() {
+		items = TranscriptGrouping.fold(entries, trailingTurnActive: trailingTurnActive, liveSteps: liveSteps)
 	}
 }
