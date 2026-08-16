@@ -24,4 +24,5 @@ ios/ConductorRemote.xcodeproj/
 ios/build/
 ios/**/.build/
 ios/**/DerivedData/
+ios/**/.swiftpm/
 ios/Signing.local.xcconfig

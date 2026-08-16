@@ -102,6 +102,14 @@ several phones are connected, `--release`, `--no-launch`, `--list-devices`,
 | Wi-Fi install stalls or drops | Use the cable — wireless `devicectl` installs are best-effort. |
 | Anything else | Open `ios/ConductorRemote.xcodeproj` in Xcode once — the Signing pane surfaces account problems interactively. |
 
+**TODO — pairing papercut** (hit live on first device pairing): `PairingParser`
+(`ConductorKit/Sources/ConductorKit/Persistence/TokenStore.swift`) rejects a
+pasted link whose scheme iOS auto-capitalized (`Https://…` fails the
+case-sensitive `hasPrefix("http")`) and any link with internal whitespace (chat
+line-wraps add one mid-URL). Loosen it: compare the scheme case-insensitively
+and strip whitespace before parsing, then redeploy. The QR scan path is the
+workaround.
+
 ## Deferred (designed, not built)
 
 - **APNs push + lock-screen Reply** — needs a paid Apple Developer account and
