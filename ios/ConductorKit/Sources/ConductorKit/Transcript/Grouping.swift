@@ -10,6 +10,8 @@ public enum TranscriptItem: Sendable, Equatable, Identifiable {
 	/// or any step of the live trailing run while the agent works).
 	case step(TranscriptEntry)
 	case steps(StepGroup)
+	/// A sub-agent's whole run, nested under its Task like the Mac app.
+	case agentSteps(AgentRun)
 	/// The end-of-turn receipt: duration + per-file `+N −M` chips.
 	case turnSummary(TurnSummary)
 
@@ -17,9 +19,22 @@ public enum TranscriptItem: Sendable, Equatable, Identifiable {
 		switch self {
 		case .message(let entry), .step(let entry): entry.key
 		case .steps(let group): group.id
+		case .agentSteps(let run): run.id
 		case .turnSummary(let summary): summary.id
 		}
 	}
+}
+
+/// One sub-agent: the Task row that spawned it plus everything it emitted
+/// (entries whose `parentToolUseId` names the Task). Children keep arriving
+/// while it runs — the closed header's count is the live signal.
+public struct AgentRun: Sendable, Equatable, Identifiable {
+	public let task: TranscriptEntry
+	public let children: [TranscriptEntry]
+
+	/// The Task row's key — stable while children grow, same rule as StepGroup.
+	public var id: String { task.key }
+	public var failedCount: Int { children.count(where: \.isError) }
 }
 
 /// One completed turn's accounting, shown as the Mac's summary row.
@@ -89,6 +104,20 @@ public enum TranscriptGrouping {
 	}
 
 	private static func foldTurn(_ entries: [TranscriptEntry], unfoldTrailingRun: Bool) -> [TranscriptItem] {
+		// Lift sub-agent children out first and hang them off their Task's id
+		// (an orphan whose Task isn't in view falls back to a plain step —
+		// shouldn't happen, the Task row always precedes its children).
+		let agentIds = Set(entries.compactMap(\.agentId))
+		var childrenOf: [String: [TranscriptEntry]] = [:]
+		var flow: [TranscriptEntry] = []
+		for entry in entries {
+			if let parent = entry.parentToolUseId, agentIds.contains(parent) {
+				childrenOf[parent, default: []].append(entry)
+			} else {
+				flow.append(entry)
+			}
+		}
+
 		var items: [TranscriptItem] = []
 		var run: [TranscriptEntry] = []
 
@@ -101,7 +130,13 @@ public enum TranscriptGrouping {
 			run.removeAll(keepingCapacity: true)
 		}
 
-		for entry in entries {
+		for entry in flow {
+			// An agent block sits inline like the Mac's, never buried in "N steps".
+			if let agentId = entry.agentId {
+				flush()
+				items.append(.agentSteps(AgentRun(task: entry, children: childrenOf[agentId] ?? [])))
+				continue
+			}
 			switch entry.role {
 			case .tool, .thinking:
 				run.append(entry)

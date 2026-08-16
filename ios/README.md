@@ -40,13 +40,67 @@ xcodebuild -project ConductorRemote.xcodeproj -scheme ConductorRemote \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
 ```
 
-Simulator builds need no signing. For a device build, set your team in Xcode's
-Signing pane (kept in the gitignored project) — free provisioning works but
-re-signs every 7 days and cannot use push entitlements.
+Simulator builds need no signing; for a real iPhone see
+[Deploy to your phone](#deploy-to-your-phone).
 
 To point a simulator at the local relay: run `yarn start`, open the app, paste
 `http://127.0.0.1:8787/#token=<token>` (token in
 `~/Library/Application Support/conductor-remote/token`).
+
+## Deploy to your phone
+
+Routine deploy — one command from the repo root, phone on a cable (Wi-Fi works
+once paired, but is slower and flakier):
+
+```bash
+yarn ios:deploy
+```
+
+It resolves your signing team (persisted in the gitignored
+`ios/Signing.local.xcconfig` after the first run), regenerates the project with
+XcodeGen, builds Debug for the connected iPhone with automatic signing,
+installs with `devicectl`, and launches. Flags: `--device <name|udid>` when
+several phones are connected, `--release`, `--no-launch`, `--list-devices`,
+`--team <ID>` to override the team once.
+
+### One-time setup
+
+1. **Xcode → Settings → Accounts → "+"** — sign in with your Apple ID. A free
+   account is fine (no paid membership needed).
+2. **Cable the iPhone** to the Mac, unlock it, tap **Trust This Computer**.
+3. **Enable Developer Mode** on the phone: Settings → Privacy & Security →
+   Developer Mode → on (the phone reboots).
+4. Run `yarn ios:deploy`. The first build mints your signing certificate — a
+   macOS keychain dialog may appear: enter your login password and click
+   **Always Allow**.
+5. After the first install, trust the app on the phone: Settings → General →
+   **VPN & Device Management** → your Apple ID → **Trust**. Then it launches.
+6. **Pair with the relay**: `yarn service status` prints the relay URL — scan
+   the QR in-app, or paste the `https://…#token=…` link. One-time; the token
+   lives in the iOS Keychain and survives reinstalls and re-signs.
+
+### Free-account caveats
+
+- The signature **expires after 7 days** — the app just stops launching. The
+  fix is rerunning `yarn ios:deploy`; pairing and app data survive.
+- At most **3 sideloaded apps** on the phone at once, and ~**10 new app IDs
+  per week** across all projects.
+- No push entitlements — which is why APNs is in "Deferred" below.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| "no iPhone found" | Cable + unlock + re-tap Trust; `yarn ios:deploy --list-devices` to check. |
+| "No Account for Team" | Add your Apple ID in Xcode → Settings → Accounts, rerun. |
+| "No signing certificate" | Rerun; approve the keychain dialog (**Always Allow**). |
+| `errSecInternalComponent` | Keychain locked / no GUI session — run from a local terminal, not SSH. |
+| "Developer Mode" errors | Settings → Privacy & Security → Developer Mode → on → reboot → rerun. |
+| "device is locked" | Unlock the phone and keep it unlocked during install. |
+| `ApplicationVerificationFailed` / profile errors | The 7-day profile expired — rerun; if it persists, delete the app from the phone first. |
+| "Untrusted Developer" on launch | Settings → General → VPN & Device Management → Trust. |
+| Wi-Fi install stalls or drops | Use the cable — wireless `devicectl` installs are best-effort. |
+| Anything else | Open `ios/ConductorRemote.xcodeproj` in Xcode once — the Signing pane surfaces account problems interactively. |
 
 ## Deferred (designed, not built)
 

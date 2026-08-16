@@ -1,10 +1,36 @@
 import ConductorKit
 import SwiftUI
 
+/// Settings ▸ Appearance ▸ Text size: an app-wide Dynamic Type override.
+/// `system` (nil) follows the device's own setting; the rest pin a size, which
+/// scales every screen because the whole app uses relative fonts.
+enum TextScale: String, CaseIterable {
+	case compact, system, large, extraLarge
+
+	var label: String {
+		switch self {
+		case .compact: "Compact"
+		case .system: "System"
+		case .large: "Large"
+		case .extraLarge: "Extra large"
+		}
+	}
+
+	var dynamicTypeSize: DynamicTypeSize? {
+		switch self {
+		case .compact: .small
+		case .system: nil
+		case .large: .xLarge
+		case .extraLarge: .xxxLarge
+		}
+	}
+}
+
 struct SettingsView: View {
 	@Environment(AppModel.self) private var model
 	@Environment(\.dismiss) private var dismiss
 	@State private var confirmDisconnect = false
+	@AppStorage("ui.textScale") private var textScale = TextScale.system
 
 	var body: some View {
 		NavigationStack {
@@ -35,11 +61,16 @@ struct SettingsView: View {
 					Toggle(
 						"Show steps while working",
 						isOn: Binding(get: { model.liveSteps }, set: { model.setLiveSteps($0) }))
+					Picker("Text size", selection: $textScale) {
+						ForEach(TextScale.allCases, id: \.self) { scale in
+							Text(scale.label).tag(scale)
+						}
+					}
 				} header: {
-					Text("Transcript")
+					Text("Appearance")
 				} footer: {
 					Text(
-						"On: the working turn's steps stream as individual rows, like the Mac app. Off: they stay collapsed into a live-updating \"N steps\" group until the turn ends."
+						"Steps on: the working turn's steps stream as individual rows, like the Mac app; off keeps them collapsed into a live-updating \"N steps\" group until the turn ends. Text size scales every screen."
 					)
 				}
 

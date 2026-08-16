@@ -17,10 +17,19 @@ export interface ViewPrefs {
 	collapsed: string[]
 	/** Stream the working turn's steps as individual rows (Mac-style); off = keep them folded. */
 	liveSteps: boolean
+	/** UI density: a zoom factor over the whole app (1 = system). */
+	textScale: number
 }
 
 const VIEW_KEY = 'conductor-remote-view'
-const defaultView: ViewPrefs = { groupBy: 'status', repo: null, sortBy: 'updated', collapsed: [], liveSteps: false }
+const defaultView: ViewPrefs = {
+	groupBy: 'status',
+	repo: null,
+	sortBy: 'updated',
+	collapsed: [],
+	liveSteps: false,
+	textScale: 1
+}
 
 /**
  * A prompt shown optimistically in the transcript before the relay confirms it.

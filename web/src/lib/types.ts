@@ -214,6 +214,10 @@ export interface TranscriptEntry {
 	adds?: number
 	dels?: number
 	hunk?: string
+	/** A Task/Agent tool_use's own id — the id its sub-agent's entries reference. */
+	agentId?: string
+	/** Set on every entry a sub-agent emitted: the spawning Task's id. */
+	parentToolUseId?: string
 }
 
 export interface QuestionOption {

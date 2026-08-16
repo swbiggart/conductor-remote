@@ -40,6 +40,16 @@ export interface TranscriptEntry {
 	attachments?: AttachmentRef[]
 	/** Conductor's turn id — what groups a turn's entries for duration + per-file summaries. */
 	turnId?: string
+	/**
+	 * Sub-agent nesting, mirrored from the SDK stream: a Task/Agent tool_use
+	 * carries its own id as `agentId`, and every frame the sub-agent emits
+	 * carries that id as `parentToolUseId` — the join clients group by.
+	 * Deliberately not `toolUseId`, which is the interactive-tools join key
+	 * `reads.pendingInput` scans; overloading it would risk a Task at the tail
+	 * reading as a question.
+	 */
+	agentId?: string
+	parentToolUseId?: string
 	/** Lines added by an Edit/Write/MultiEdit tool call (common prefix/suffix trimmed first). */
 	adds?: number
 	/** Lines removed, same accounting. */
@@ -314,7 +324,12 @@ export function parseMessage(row: RawRow, worktree: string | null = null): Trans
 		return [{ ...base, id: row.id, role: 'user', ...parseAttachmentRefs(content) }]
 	}
 
-	let parsed: { type?: string; subtype?: string; message?: { content?: SdkBlock[] } }
+	let parsed: {
+		type?: string
+		subtype?: string
+		message?: { content?: SdkBlock[] }
+		parent_tool_use_id?: string | null
+	}
 	try {
 		parsed = JSON.parse(content)
 	} catch {
@@ -350,9 +365,17 @@ export function parseMessage(row: RawRow, worktree: string | null = null): Trans
 		return [{ ...base, id: row.id, role: 'system', text: clip(content, 200) }]
 	}
 
+	// Frames a sub-agent emits carry the spawning Task's tool_use id — attach it
+	// to every entry from the frame so clients can nest the run under its agent.
+	const parentId = str(parsed.parent_tool_use_id ?? undefined)
 	const entries: TranscriptEntry[] = []
 	const push = (e: Pick<TranscriptEntry, 'role' | 'text'> & Partial<TranscriptEntry>) =>
-		entries.push({ ...base, ...e, id: `${row.id}:${entries.length}` })
+		entries.push({
+			...base,
+			...(parentId ? { parentToolUseId: parentId } : {}),
+			...e,
+			id: `${row.id}:${entries.length}`
+		})
 
 	let pending: string[] = []
 	const flush = () => {
@@ -389,7 +412,14 @@ export function parseMessage(row: RawRow, worktree: string | null = null): Trans
 			} else if (interactive === 'ExitPlanMode' && plan) {
 				push({ role: 'tool', tool: 'ExitPlanMode', toolUseId: b.id, plan, text: 'Proposed a plan for review' })
 			} else {
-				push({ role: 'tool', tool: b.name, ...summarizeToolUse(b.name, b.input, worktree) })
+				// Task/Agent spawns a sub-agent whose frames will reference this id.
+				const agentId = (b.name === 'Task' || b.name === 'Agent') && typeof b.id === 'string' ? b.id : undefined
+				push({
+					role: 'tool',
+					tool: b.name,
+					...(agentId ? { agentId } : {}),
+					...summarizeToolUse(b.name, b.input, worktree)
+				})
 			}
 		} else if (b.type === 'tool_result' && b.is_error) {
 			// Successful results are noise on a phone; surface only failures.

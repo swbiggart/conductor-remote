@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import { Navigate, Outlet, Route, Routes, useMatch } from 'react-router'
 import { ReloadPrompt } from './components/ReloadPrompt.tsx'
 import { SessionView } from './components/SessionView.tsx'
@@ -11,6 +11,13 @@ import { useApp } from './store.ts'
 export function App() {
 	useVisualViewportHeight()
 	const token = useApp(s => s.token)
+	const textScale = useApp(s => s.view.textScale)
+	// Density: `zoom` scales layout *and* text together (unlike transform) and
+	// WebKit/Blink both honour it. Applied to the document root so every
+	// surface — list, chat, sheets — moves as one.
+	useEffect(() => {
+		document.documentElement.style.zoom = textScale === 1 ? '' : String(textScale)
+	}, [textScale])
 	// ReloadPrompt sits above the token gate so SW updates apply on every screen.
 	return (
 		<>

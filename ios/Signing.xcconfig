@@ -1,0 +1,6 @@
+// Committed signing defaults. Personal settings (DEVELOPMENT_TEAM) live in the
+// gitignored Signing.local.xcconfig, written by `yarn ios:deploy` — the #include?
+// is optional on purpose: simulator builds need no signing, and xcodebuild
+// (unlike the Xcode GUI) errors out on a missing baseConfiguration file, so the
+// committed file must always exist.
+#include? "Signing.local.xcconfig"

@@ -98,6 +98,8 @@ struct TranscriptView: View {
 			StepRow(entry: entry, sessionID: session.id)
 		case .steps(let group):
 			StepGroupView(group: group, sessionID: session.id)
+		case .agentSteps(let run):
+			AgentGroupView(run: run, sessionID: session.id)
 		case .turnSummary(let summary):
 			TurnSummaryRow(summary: summary)
 		}
@@ -449,6 +451,66 @@ func toolSymbol(_ tool: String?) -> String {
 	case "WebFetch", "WebSearch": "globe"
 	case "Agent", "Task": "person.2"
 	default: "chevron.right.circle"
+	}
+}
+
+/// A sub-agent's run, nested under its Task like the Mac app: bot header with
+/// the task description and live step count; open, the sub-agent's prompt then
+/// its own steps.
+struct AgentGroupView: View {
+	let run: AgentRun
+	let sessionID: String
+	@State private var expanded = false
+
+	var body: some View {
+		VStack(alignment: .leading, spacing: 6) {
+			Button {
+				withAnimation(.spring(duration: 0.25)) { expanded.toggle() }
+			} label: {
+				HStack(alignment: .firstTextBaseline, spacing: 6) {
+					Image(systemName: "person.2")
+						.font(.caption)
+						.foregroundStyle(.secondary)
+					Text("Agent")
+						.font(.footnote.weight(.medium))
+						.foregroundStyle(.secondary)
+					Text(run.task.text)
+						.font(.footnote)
+						.foregroundStyle(.primary.opacity(0.8))
+						.lineLimit(1)
+					Text("\(run.children.count) steps")
+						.font(.caption)
+						.foregroundStyle(.tertiary)
+					if run.failedCount > 0 {
+						Text("\(run.failedCount) failed")
+							.font(.caption.weight(.medium))
+							.foregroundStyle(Color.diffDelete)
+					}
+					Image(systemName: "chevron.right")
+						.font(.caption2.weight(.semibold))
+						.foregroundStyle(.tertiary)
+						.rotationEffect(.degrees(expanded ? 90 : 0))
+				}
+			}
+			.buttonStyle(.plain)
+			.animation(.default, value: run.children.count)
+
+			if expanded {
+				VStack(alignment: .leading, spacing: 5) {
+					if let prompt = run.task.detail {
+						Text(prompt)
+							.font(.caption.monospaced())
+							.foregroundStyle(.tertiary)
+							.padding(.bottom, 2)
+					}
+					ForEach(run.children) { entry in
+						StepRow(entry: entry, sessionID: sessionID)
+					}
+				}
+				.padding(.leading, 14)
+			}
+		}
+		.padding(.vertical, 2)
 	}
 }
 

@@ -331,6 +331,10 @@ public struct TranscriptEntry: Codable, Sendable, Identifiable, Equatable {
 	public let attachments: [AttachmentRef]?
 	/// Conductor's turn id — groups a turn's entries for the end-of-turn summary.
 	public let turnId: String?
+	/// A Task/Agent tool_use's own id — the id its sub-agent's entries reference.
+	public let agentId: String?
+	/// Set on every entry a sub-agent emitted: the spawning Task's id.
+	public let parentToolUseId: String?
 	/// Line counts for a file-editing tool call, plus the clipped hunk behind the chip.
 	public let adds: Int?
 	public let dels: Int?
@@ -345,7 +349,8 @@ public struct TranscriptEntry: Codable, Sendable, Identifiable, Equatable {
 	public init(
 		id: String, rowid: Int64, role: Role, text: String, tool: String?, detail: String?, error: Bool?,
 		ts: String, queued: Bool, attachments: [AttachmentRef]? = nil, turnId: String? = nil,
-		adds: Int? = nil, dels: Int? = nil, hunk: String? = nil
+		adds: Int? = nil, dels: Int? = nil, hunk: String? = nil,
+		agentId: String? = nil, parentToolUseId: String? = nil
 	) {
 		self.id = id
 		self.rowid = rowid
@@ -361,6 +366,8 @@ public struct TranscriptEntry: Codable, Sendable, Identifiable, Equatable {
 		self.adds = adds
 		self.dels = dels
 		self.hunk = hunk
+		self.agentId = agentId
+		self.parentToolUseId = parentToolUseId
 	}
 }
 

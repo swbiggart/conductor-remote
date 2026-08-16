@@ -5,11 +5,13 @@ import Testing
 
 private func entry(
 	_ rowid: Int64, _ role: Role, text: String = "", error: Bool = false, queued: Bool = false,
-	turnId: String? = nil, detail: String? = nil, adds: Int? = nil, dels: Int? = nil, ts: String = "2026-08-15 10:00:00"
+	turnId: String? = nil, detail: String? = nil, adds: Int? = nil, dels: Int? = nil,
+	ts: String = "2026-08-15 10:00:00", agentId: String? = nil, parent: String? = nil
 ) -> TranscriptEntry {
 	TranscriptEntry(
 		id: "\(rowid)", rowid: rowid, role: role, text: text, tool: nil, detail: detail,
-		error: error ? true : nil, ts: ts, queued: queued, turnId: turnId, adds: adds, dels: dels)
+		error: error ? true : nil, ts: ts, queued: queued, turnId: turnId, adds: adds, dels: dels,
+		agentId: agentId, parentToolUseId: parent)
 }
 
 @Suite struct GroupingTests {
@@ -45,6 +47,32 @@ private func entry(
 			return
 		}
 		#expect(group.lastLabel == "Thinking")
+	}
+
+	@Test func subAgentRunNestsUnderItsTask() {
+		let items = TranscriptGrouping.fold([
+			entry(1, .user),
+			entry(2, .tool, text: "before"),
+			entry(3, .tool, text: "Explore the repo", agentId: "task-1"),
+			entry(4, .tool, text: "child a", parent: "task-1"),
+			entry(5, .tool, text: "after"),
+			entry(6, .thinking, text: "child b", parent: "task-1"),
+			entry(7, .assistant, text: "done")
+		])
+		// Children lift out of the flow (even interleaved ones) and the agent
+		// block sits inline: user · step(before) · agent · step(after) · prose.
+		guard case .agentSteps(let run) = items[2] else {
+			Issue.record("expected the agent block inline, got \(items)")
+			return
+		}
+		#expect(run.children.map(\.text) == ["child a", "child b"])
+		#expect(run.id == entry(3, .tool).key)
+		guard case .step(let before) = items[1], case .step(let after) = items[3] else {
+			Issue.record("plain steps should stay in the flow")
+			return
+		}
+		#expect(before.text == "before")
+		#expect(after.text == "after")
 	}
 
 	@Test func trailingRunStaysLiveWhileWorking() {

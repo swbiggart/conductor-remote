@@ -1,4 +1,4 @@
-import { Bell, Check, Copy, ListTree, LogOut, X } from 'lucide-react'
+import { ALargeSmall, Bell, Check, Copy, ListTree, LogOut, X } from 'lucide-react'
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { usePush } from '../hooks.ts'
@@ -93,6 +93,7 @@ export function ConnectSheet({
 				</button>
 				<NotificationsRow />
 				<LiveStepsRow />
+				<TextScaleRow />
 				<div className="flex w-full items-center justify-between text-xs text-faint">
 					<span className="font-mono">
 						{version ? `relay v${version}` : 'relay v?'}
@@ -120,6 +121,44 @@ export function ConnectSheet({
  * "you denied it once, so the browser will never ask again" — neither of which a
  * greyed-out switch would explain.
  */
+const TEXT_SCALES = [
+	{ value: 0.9, label: 'Compact' },
+	{ value: 1, label: 'System' },
+	{ value: 1.1, label: 'Large' },
+	{ value: 1.25, label: 'XL' }
+]
+
+/** UI density: one zoom factor over the whole app — text and layout together. */
+function TextScaleRow() {
+	const textScale = useApp(s => s.view.textScale)
+	const setView = useApp(s => s.setView)
+	return (
+		<div className="w-full rounded-xl border border-border bg-surface-2 px-3 py-2.5">
+			<div className="flex items-center justify-between gap-3">
+				<div className="flex min-w-0 items-center gap-2 text-sm">
+					<ALargeSmall size={16} className={cn('shrink-0', textScale !== 1 ? 'text-accent' : 'text-muted')} />
+					<span>Text size</span>
+				</div>
+				<div className="flex shrink-0 overflow-hidden rounded-lg border border-border">
+					{TEXT_SCALES.map(scale => (
+						<button
+							type="button"
+							key={scale.value}
+							onClick={() => setView({ textScale: scale.value })}
+							className={cn(
+								'px-2.5 py-1 text-xs transition-colors',
+								textScale === scale.value ? 'bg-accent text-black' : 'bg-surface text-muted active:bg-surface-2'
+							)}
+						>
+							{scale.label}
+						</button>
+					))}
+				</div>
+			</div>
+		</div>
+	)
+}
+
 /** Stream the working turn's steps as individual rows (Mac-style) or keep them folded. */
 function LiveStepsRow() {
 	const liveSteps = useApp(s => s.view.liveSteps)

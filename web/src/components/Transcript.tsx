@@ -1,5 +1,5 @@
 import { useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, FileText, Image as ImageIcon, Loader2 } from 'lucide-react'
+import { AlertTriangle, Bot, FileText, Image as ImageIcon, Loader2 } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useSendPrompt, useTranscript } from '../hooks.ts'
 import { client } from '../lib/api.ts'
@@ -118,6 +118,8 @@ export function Transcript({
 						{buildRows(entries, working ?? false, liveSteps).map(row =>
 							row.kind === 'steps' ? (
 								<StepGroup key={row.key} entries={row.entries} sessionId={sessionId} />
+							) : row.kind === 'agent' ? (
+								<AgentGroup key={row.key} task={row.task} childEntries={row.children} sessionId={sessionId} />
 							) : row.kind === 'turn' ? (
 								<TurnSummaryRow key={row.key} files={row.files} seconds={row.seconds} />
 							) : (
@@ -164,6 +166,7 @@ export function Transcript({
 type Row =
 	| { kind: 'entry'; key: string; e: TranscriptEntry }
 	| { kind: 'steps'; key: string; entries: TranscriptEntry[] }
+	| { kind: 'agent'; key: string; task: TranscriptEntry; children: TranscriptEntry[] }
 	| { kind: 'turn'; key: string; files: TurnFile[]; seconds: number | null }
 
 interface TurnFile {
@@ -190,6 +193,23 @@ const parseTs = (ts: string): number | null => {
  * row's key either way, so the collapse doesn't lose expansion state elsewhere.
  */
 function groupSteps(entries: TranscriptEntry[], unfoldTrailing = false): Row[] {
+	// Sub-agent runs nest under their Task like the Mac app: every entry a
+	// sub-agent emitted names its spawning Task (`parentToolUseId`), so lift
+	// those out first and hang them off the Task's own `agentId`. A child whose
+	// Task isn't in view (shouldn't happen — the Task row always precedes its
+	// children) falls back to rendering as a plain step.
+	const agentIds = new Set(entries.filter(e => e.agentId).map(e => e.agentId as string))
+	const childrenOf = new Map<string, TranscriptEntry[]>()
+	const flow: TranscriptEntry[] = []
+	for (const e of entries) {
+		if (e.parentToolUseId && agentIds.has(e.parentToolUseId)) {
+			const bucket = childrenOf.get(e.parentToolUseId) ?? []
+			bucket.push(e)
+			childrenOf.set(e.parentToolUseId, bucket)
+		} else {
+			flow.push(e)
+		}
+	}
 	const rows: Row[] = []
 	let run: TranscriptEntry[] = []
 	const flush = (asIndividual = false) => {
@@ -197,7 +217,13 @@ function groupSteps(entries: TranscriptEntry[], unfoldTrailing = false): Row[] {
 		else for (const e of run) rows.push({ kind: 'entry', key: rowKey(e), e })
 		run = []
 	}
-	for (const e of entries) {
+	for (const e of flow) {
+		if (e.agentId) {
+			// An agent block sits inline like the Mac's, never buried in "N steps".
+			flush()
+			rows.push({ kind: 'agent', key: rowKey(e), task: e, children: childrenOf.get(e.agentId) ?? [] })
+			continue
+		}
 		if (e.role === 'tool' || e.role === 'thinking') {
 			run.push(e)
 			continue
@@ -306,6 +332,45 @@ function StepGroup({ entries, sessionId }: { entries: TranscriptEntry[]; session
 			</summary>
 			<div className="flex min-w-0 flex-col gap-2.5 border-t border-border-soft px-2 py-2.5">
 				{entries.map(e => (
+					<Entry key={rowKey(e)} e={e} sessionId={sessionId} />
+				))}
+			</div>
+		</details>
+	)
+}
+
+/**
+ * A sub-agent's run, nested under its Task like the Mac app: bot header with
+ * the task description and step count; open, the sub-agent's prompt then its
+ * own steps. Children keep arriving while the agent runs — the closed header's
+ * count is the live signal, same trick as StepGroup.
+ */
+function AgentGroup({
+	task,
+	childEntries,
+	sessionId
+}: {
+	task: TranscriptEntry
+	childEntries: TranscriptEntry[]
+	sessionId: string | null
+}) {
+	const failed = childEntries.filter(e => e.error).length
+	return (
+		<details className="group/agent min-w-0 overflow-hidden rounded-xl border border-border-soft bg-surface/40">
+			<summary className="flex cursor-pointer select-none list-none items-baseline gap-2 overflow-hidden whitespace-nowrap px-3 py-1.5 [&::-webkit-details-marker]:hidden">
+				<Bot size={13} className="shrink-0 translate-y-0.5 text-muted" />
+				<span className="shrink-0 text-[12.5px] text-muted">Agent</span>
+				<span className="min-w-0 flex-1 truncate text-[12.5px] text-text/80">{task.text}</span>
+				<span className="shrink-0 text-[11px] text-faint">{childEntries.length} steps</span>
+				{failed ? <span className="shrink-0 text-[11px] text-del">{failed} failed</span> : null}
+			</summary>
+			<div className="flex min-w-0 flex-col gap-2.5 border-t border-border-soft px-2 py-2.5">
+				{task.detail ? (
+					<div className="px-1 font-mono text-[11px] leading-relaxed text-faint [overflow-wrap:anywhere]">
+						{task.detail}
+					</div>
+				) : null}
+				{childEntries.map(e => (
 					<Entry key={rowKey(e)} e={e} sessionId={sessionId} />
 				))}
 			</div>
