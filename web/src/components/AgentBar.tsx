@@ -79,7 +79,7 @@ export function AgentBar({ session, workspaceId }: { session: Session; workspace
 					<button
 						type="button"
 						onClick={() => setPicking(p => !p)}
-						className={cn('ctl flex max-w-40 items-center gap-1', staged.model && 'ctl-staged')}
+						className={cn('ctl flex max-w-40 items-center gap-1', staged.model && 'ctl-staged ctl-staged-on')}
 					>
 						<span className="truncate">{staged.model ?? modelPill(session)}</span>
 						<ChevronDown size={13} className="shrink-0" />
@@ -130,22 +130,31 @@ export function AgentBar({ session, workspaceId }: { session: Session; workspace
 					<button
 						type="button"
 						onClick={() => stage({ effort: change(nextEffort(), dbEffort) })}
-						className={cn('ctl', staged.effort && 'ctl-staged')}
+						className={cn('ctl', staged.effort && 'ctl-staged ctl-staged-on')}
 					>
 						{EFFORT_LABELS[effort]}
 					</button>
 				) : null}
+				{/* Fill = the value the next prompt runs with; dashed outline = staged.
+				    Solid is reserved for Conductor's own state, so a staged-to-on pill
+				    (tinted + dashed) can't be mistaken for already-on. */}
 				<button
 					type="button"
 					onClick={() => stage({ plan: change(!planOn, dbPlan) })}
-					className={cn('ctl', planOn && 'ctl-on', staged.plan !== undefined && 'ctl-staged')}
+					className={cn(
+						'ctl',
+						staged.plan === undefined ? planOn && 'ctl-on' : cn('ctl-staged', planOn && 'ctl-staged-on')
+					)}
 				>
 					Plan
 				</button>
 				<button
 					type="button"
 					onClick={() => stage({ fast: change(!fastOn, dbFast) })}
-					className={cn('ctl flex items-center gap-1', fastOn && 'ctl-on', staged.fast !== undefined && 'ctl-staged')}
+					className={cn(
+						'ctl flex items-center gap-1',
+						staged.fast === undefined ? fastOn && 'ctl-on' : cn('ctl-staged', fastOn && 'ctl-staged-on')
+					)}
 				>
 					<Zap size={13} />
 					Fast

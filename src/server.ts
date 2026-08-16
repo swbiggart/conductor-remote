@@ -27,6 +27,7 @@ import { Reads, type SessionRow, type Workspace } from './reads.ts'
 import { driftWarningLines, tailscaleBin } from './tailscale.ts'
 import {
 	type AgentOptions,
+	answerSession,
 	type ChatTab,
 	createWorkspace,
 	describeActuator,
@@ -162,7 +163,11 @@ async function confirmAgentOptions(ws: Workspace, sessionId: string, opts: Agent
 	for (let attempt = 0; attempt < 10; attempt++) {
 		const s = reads.listSessions(ws.id).find(row => row.id === sessionId)
 		const effortOk = !opts.effort || s?.claude_effort_level === opts.effort
-		const planOk = opts.plan === undefined || s?.permission_mode === (opts.plan ? 'plan' : 'default')
+		// Plan-off confirms on anything that isn't 'plan' — only 'default' lives in the
+		// DB today, but hard-coding the one other value Conductor happens to write would
+		// turn a third spelling into a permanent 502.
+		const planOk =
+			opts.plan === undefined || (opts.plan ? s?.permission_mode === 'plan' : s?.permission_mode !== 'plan')
 		if (effortOk && planOk) return true
 		await sleep(300)
 	}
@@ -685,8 +690,14 @@ const server = http.createServer(async (req, res) => {
 		// GET /api/sessions/:id/messages?after=<rowid>
 		m = pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)
 		if (req.method === 'GET' && m) {
+			const sessionId = decodeURIComponent(m[1])
 			const after = Number(url.searchParams.get('after') ?? 0)
-			return json(req, res, 200, reads.getMessages(decodeURIComponent(m[1]), Number.isFinite(after) ? after : 0))
+			// `pending` rides the open chat's 1s poll — the cheapest place for it, and
+			// the only place that can *answer*. Additive: a stale PWA ignores it.
+			return json(req, res, 200, {
+				...reads.getMessages(sessionId, Number.isFinite(after) ? after : 0),
+				pending: reads.pendingInput(sessionId)
+			})
 		}
 
 		// GET /api/sessions/:id/models?workspaceId= — labels from Conductor's live picker
@@ -723,6 +734,83 @@ const server = http.createServer(async (req, res) => {
 			const applied = await applyAgentPatch(ws, sessionId, body)
 			if (!applied.ok) return json(req, res, 502, { ok: false, strategy: actuator.name, error: applied.error })
 			return json(req, res, 200, { ok: true, session: reads.listSessions(ws.id).find(s => s.id === sessionId) })
+		}
+
+		// POST /api/sessions/:id/answer — press an option or Approve on the chat's
+		// pending question/plan card. Validated against the live pending read before
+		// anything is pressed, and confirmed against the transcript receipt after.
+		m = pathname.match(/^\/api\/sessions\/([^/]+)\/answer$/)
+		if (req.method === 'POST' && m) {
+			const sessionId = decodeURIComponent(m[1])
+			const body = JSON.parse((await readBody(req)) || '{}') as {
+				workspaceId?: string
+				toolUseId?: string
+				kind?: 'question' | 'plan'
+				options?: string[]
+				approve?: boolean
+			}
+			if (!body.toolUseId || (body.kind !== 'question' && body.kind !== 'plan')) {
+				return json(req, res, 400, { error: 'toolUseId and kind are required' })
+			}
+			const ws = body.workspaceId
+				? reads.getWorkspace(body.workspaceId)
+				: (reads.listWorkspaces().find(w => w.active_session_id === sessionId) ?? null)
+			if (!ws) return json(req, res, 404, { error: 'workspace for session not found' })
+			const located = locateChat(ws, sessionId)
+			if ('error' in located) return json(req, res, 409, { error: located.error })
+			// Fail closed against the live read: a card answered on the Mac between the
+			// phone's poll and this POST must become a refusal (or an idempotent ok),
+			// never a press against whatever the chat shows now.
+			const pending = reads.pendingInput(sessionId)
+			if (!pending || pending.toolUseId !== body.toolUseId || pending.kind !== body.kind) {
+				if (reads.answerRecorded(sessionId, body.toolUseId, 0)) {
+					return json(req, res, 200, { ok: true, already: true })
+				}
+				return json(req, res, 409, {
+					ok: false,
+					error: 'that question is no longer waiting — it may have been answered on the Mac'
+				})
+			}
+			let labels: string[] = []
+			if (body.kind === 'question') {
+				const q = pending.questions?.[0]
+				if (!q || pending.questions?.length !== 1 || q.multiSelect) {
+					return json(req, res, 400, {
+						error: 'only single-choice questions can be answered from the phone — answer this one in Conductor'
+					})
+				}
+				labels = body.options ?? []
+				if (labels.length !== 1 || !q.options.some(o => o.label === labels[0])) {
+					return json(req, res, 400, { error: 'the answer must be exactly one of the question’s own options' })
+				}
+			} else if (!body.approve) {
+				return json(req, res, 400, {
+					error: 'plan answers support approve only — to keep planning, reply from the composer'
+				})
+			}
+			const result = await answerSession({ workspace: ws, sessionId, tab: located.tab }, { kind: body.kind, labels })
+			if (!result.ok && lockBlocked(result.error)) {
+				// Deliberately not parked (unlike a prompt): a parked button-press firing
+				// hours later would land in a conversation that may have moved on.
+				return json(req, res, 409, {
+					ok: false,
+					strategy: result.strategy,
+					error: 'The Mac is locked — unlock it to answer, or reply from the Mac.'
+				})
+			}
+			// The receipt is the truth (see confirmDelivery): watch for the tool_result row
+			// regardless of what the press reported — a press that landed but reported an
+			// error is a success, and a retry after a lost report turns into already:true.
+			const stopAt = Date.now() + CONFIRM_WINDOW_MS
+			while (Date.now() < stopAt) {
+				if (reads.answerRecorded(sessionId, pending.toolUseId, pending.rowid)) return json(req, res, 200, { ok: true })
+				await sleep(300)
+			}
+			return json(req, res, 502, {
+				ok: false,
+				strategy: result.strategy,
+				error: result.ok ? 'the answer didn’t register — try again' : result.error
+			})
 		}
 
 		// POST /api/sessions/:id/prompt  { text, agent? } — agent is the phone's staged

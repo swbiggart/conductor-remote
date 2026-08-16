@@ -6,7 +6,7 @@ import { ApiError, client } from './lib/api.ts'
 import { readModelCache, writeModelCache } from './lib/models.ts'
 import type { PushSupport } from './lib/push.ts'
 import { currentSubscription, deviceLabel, pushSupport, subscribe, syncSubscription, toJson } from './lib/push.ts'
-import type { Session, TranscriptEntry } from './lib/types.ts'
+import type { PendingInput, Session, TranscriptEntry } from './lib/types.ts'
 import { useApp } from './store.ts'
 
 /**
@@ -284,6 +284,7 @@ export function useRepos() {
 
 export function useSessions(workspaceId: string | undefined) {
 	const report = useOnline()
+	const reconcile = useApp(s => s.reconcileAgentDrafts)
 	const query = useQuery({
 		queryKey: ['sessions', workspaceId],
 		queryFn: () => client.sessions(workspaceId as string),
@@ -293,6 +294,11 @@ export function useSessions(workspaceId: string | undefined) {
 	useEffect(() => {
 		if (query.isError) report(false, query.error)
 	}, [query.isError, query.error, report])
+	// Staged agent values the DB has caught up with are no-op patches — drop them
+	// so the pills settle back to Conductor's own state (store bails when nothing drops).
+	useEffect(() => {
+		if (query.data) reconcile(query.data.sessions)
+	}, [query.data, reconcile])
 	return query
 }
 
@@ -379,6 +385,8 @@ export function useModels(session: Session | undefined, workspaceId: string, ena
 
 export interface TranscriptState {
 	entries: TranscriptEntry[]
+	/** Question/plan the agent is stopped on, or null. Refreshed every tick — that's how the card clears. */
+	pending: PendingInput | null
 	loading: boolean
 	error: string | null
 }
@@ -389,28 +397,41 @@ export interface TranscriptState {
  */
 export function useTranscript(sessionId: string | null): TranscriptState {
 	const report = useOnline()
-	const [state, setState] = useState<TranscriptState>({ entries: [], loading: true, error: null })
+	const [state, setState] = useState<TranscriptState>({ entries: [], pending: null, loading: true, error: null })
 	const cursor = useRef(0)
 
 	useEffect(() => {
 		if (!sessionId) {
-			setState({ entries: [], loading: false, error: null })
+			setState({ entries: [], pending: null, loading: false, error: null })
 			return
 		}
 		cursor.current = 0
-		setState({ entries: [], loading: true, error: null })
+		setState({ entries: [], pending: null, loading: true, error: null })
 		let alive = true
 
 		const tick = async () => {
 			try {
-				const { entries, cursor: next } = await client.messages(sessionId, cursor.current)
+				const { entries, cursor: next, pending } = await client.messages(sessionId, cursor.current)
 				if (!alive) return
 				report(true)
+				// `pending` is set on *every* tick, including empty ones — a question answered
+				// on the Mac clears the card through exactly that path.
 				if (entries.length) {
 					cursor.current = next
-					setState(prev => ({ entries: [...prev.entries, ...entries], loading: false, error: null }))
+					setState(prev => ({
+						entries: [...prev.entries, ...entries],
+						pending: pending ?? null,
+						loading: false,
+						error: null
+					}))
 				} else {
-					setState(prev => (prev.loading ? { ...prev, loading: false } : prev))
+					// Same card every tick is the steady state — bail on the toolUseId, not the
+					// object (a fresh parse each response), or every tick re-renders the chat.
+					setState(prev =>
+						prev.loading || (pending?.toolUseId ?? null) !== (prev.pending?.toolUseId ?? null)
+							? { ...prev, pending: pending ?? null, loading: false }
+							: prev
+					)
 				}
 			} catch (err) {
 				if (!alive) return

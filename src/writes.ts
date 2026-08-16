@@ -457,6 +457,54 @@ return "ok"`.trim()
 	}
 }
 
+/** What the phone pressed on a question/plan card (see `answerSession`). */
+export interface AnswerAction {
+	kind: 'question' | 'plan'
+	/** Option labels to press, in order (one for single-select). Ignored for plan approval. */
+	labels: string[]
+}
+
+/**
+ * Approve-button labels tried in order on the plan card. Nothing documents the
+ * card's AX shape, so a miss errors with every pressable name it *did* see — the
+ * failure is the discovery dump. A rename here is a one-line edit.
+ */
+const APPROVE_LABELS = ['Approve plan', 'Approve']
+
+/**
+ * Answer a pending question or approve a pending plan in one chat: same verified
+ * focus path as a send, then press the card's own buttons by their exact labels.
+ * The caller (server.ts) validates the labels against the live pending read
+ * before this runs and confirms afterwards against the transcript receipt — this
+ * function only ever presses a unique match, and errors in words otherwise.
+ */
+export async function answerSession(target: SendTarget, action: AnswerAction): Promise<SendResult> {
+	const script = `
+${CONDUCTOR_HANDLERS}
+
+my activateConductor()
+my focusWorkspace()
+my selectChatTab()
+${action.kind === 'plan' ? 'my pressApprovePlan()' : 'my pressAnswerOption()'}
+return "ok"`.trim()
+	try {
+		await uiTurn(() =>
+			exec('osascript', ['-e', script], {
+				env: {
+					...process.env,
+					...targetEnv(target),
+					RELAY_ANSWER_LABELS: action.labels.join('\n'),
+					RELAY_APPROVE_LABELS: APPROVE_LABELS.join('\n')
+				},
+				timeout: SEND_ATTEMPT_MS
+			})
+		)
+		return { ok: true, strategy: 'applescript' }
+	} catch (err) {
+		return { ok: false, strategy: 'applescript', error: osaError(err) }
+	}
+}
+
 /**
  * The workspace statuses Conductor's sidebar groups by, mapped from the value it
  * stores in `workspaces.manual_status` to the label on its own menu. `canceled`

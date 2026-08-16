@@ -190,13 +190,41 @@ export interface TranscriptEntry {
 	detail?: string
 	/** True when this row is a failed tool result. */
 	error?: boolean
+	/** tool_use id, set only for interactive tools (mirrors src/transcript.ts). */
+	toolUseId?: string
+	questions?: PendingQuestion[]
+	plan?: string
 	ts: string
 	queued: boolean
+}
+
+export interface QuestionOption {
+	label: string
+	description?: string
+}
+
+export interface PendingQuestion {
+	question: string
+	header?: string
+	multiSelect?: boolean
+	options: QuestionOption[]
+}
+
+/** A question or plan the agent is stopped on (mirrors PendingInput in src/reads.ts). */
+export interface PendingInput {
+	kind: 'question' | 'plan'
+	toolUseId: string
+	rowid: number
+	questions?: PendingQuestion[]
+	plan?: string
+	ts: string
 }
 
 export interface MessagesResponse {
 	entries: TranscriptEntry[]
 	cursor: number
+	/** Absent from relays older than this field — treat as "nothing pending". */
+	pending?: PendingInput | null
 }
 
 export interface DiffFile {

@@ -22,9 +22,32 @@ export interface TranscriptEntry {
 	detail?: string
 	/** True when this row is a failed tool result. */
 	error?: boolean
+	/**
+	 * The tool_use block's own id, set only for the interactive tools (AskUserQuestion /
+	 * ExitPlanMode). It is the join key everything downstream leans on: the answer's
+	 * tool_result carries the same id, which is how `reads.pendingInput` tells an open
+	 * question from an answered one.
+	 */
+	toolUseId?: string
+	/** AskUserQuestion's parsed questions — present only when they parsed cleanly. */
+	questions?: PendingQuestion[]
+	/** ExitPlanMode's plan markdown, verbatim. */
+	plan?: string
 	ts: string
 	/** True when the message is queued but not yet sent (queue_order set, sent_at null). */
 	queued: boolean
+}
+
+export interface QuestionOption {
+	label: string
+	description?: string
+}
+
+export interface PendingQuestion {
+	question: string
+	header?: string
+	multiSelect?: boolean
+	options: QuestionOption[]
 }
 
 interface RawRow {
@@ -40,6 +63,7 @@ interface RawRow {
 
 interface SdkBlock {
 	type: string
+	id?: string
 	text?: string
 	thinking?: string
 	name?: string
@@ -73,6 +97,54 @@ function summarizeToolUse(name: string, input: unknown, worktree: string | null)
 		str(o.command) ?? str(o.file_path) ?? str(o.path) ?? str(o.pattern) ?? str(o.url) ?? str(o.skill) ?? str(o.prompt)
 	if (!detail || detail === text) return { text }
 	return { text, detail: clip(stripWorktree(detail, worktree).replace(/\s+/g, ' '), 160) }
+}
+
+/**
+ * The two tools that stop the turn to wait on the user. Conductor routes questions
+ * through its MCP server (`mcp__conductor__AskUserQuestion` — every question frame in
+ * this DB), but the built-in name could appear if Claude Code routes it itself.
+ */
+function interactiveTool(name: string): 'AskUserQuestion' | 'ExitPlanMode' | null {
+	if (name === 'ExitPlanMode') return 'ExitPlanMode'
+	if (name === 'AskUserQuestion' || /^mcp__.+__AskUserQuestion$/.test(name)) return 'AskUserQuestion'
+	return null
+}
+
+/**
+ * Normalize AskUserQuestion input to labelled options. Conductor's MCP shape carries
+ * options as plain strings; the built-in tool uses `{label, description}`. Anything
+ * else returns null and the entry falls back to the plain tool row — a question we
+ * can't parse must not become a card with wrong choices.
+ */
+function parseQuestions(input: unknown): PendingQuestion[] | null {
+	if (!input || typeof input !== 'object') return null
+	const raw = (input as Record<string, unknown>).questions
+	if (!Array.isArray(raw) || raw.length === 0) return null
+	const out: PendingQuestion[] = []
+	for (const q of raw) {
+		if (!q || typeof q !== 'object') return null
+		const o = q as Record<string, unknown>
+		const question = str(o.question)
+		if (!question || !Array.isArray(o.options) || o.options.length === 0) return null
+		const options: QuestionOption[] = []
+		for (const opt of o.options) {
+			if (typeof opt === 'string' && opt.trim()) {
+				options.push({ label: opt.trim() })
+			} else if (opt && typeof opt === 'object' && str((opt as Record<string, unknown>).label)) {
+				const l = opt as Record<string, unknown>
+				options.push({ label: str(l.label) as string, description: str(l.description) })
+			} else {
+				return null
+			}
+		}
+		out.push({
+			question,
+			header: str(o.header),
+			multiSelect: typeof o.multiSelect === 'boolean' ? o.multiSelect : undefined,
+			options
+		})
+	}
+	return out
 }
 
 function resultText(content: unknown): string {
@@ -135,7 +207,26 @@ export function parseMessage(row: RawRow, worktree: string | null = null): Trans
 			if (text) push({ role: 'thinking', text })
 		} else if (b.type === 'tool_use' && typeof b.name === 'string') {
 			flush()
-			push({ role: 'tool', tool: b.name, ...summarizeToolUse(b.name, b.input, worktree) })
+			const interactive = typeof b.id === 'string' ? interactiveTool(b.name) : null
+			const questions = interactive === 'AskUserQuestion' ? parseQuestions(b.input) : null
+			const plan =
+				interactive === 'ExitPlanMode' && b.input && typeof b.input === 'object'
+					? str((b.input as Record<string, unknown>).plan)
+					: undefined
+			if (interactive === 'AskUserQuestion' && questions) {
+				// text carries the question so a stale PWA's plain tool row shows it too.
+				push({
+					role: 'tool',
+					tool: 'AskUserQuestion',
+					toolUseId: b.id,
+					questions,
+					text: questions[0].question
+				})
+			} else if (interactive === 'ExitPlanMode' && plan) {
+				push({ role: 'tool', tool: 'ExitPlanMode', toolUseId: b.id, plan, text: 'Proposed a plan for review' })
+			} else {
+				push({ role: 'tool', tool: b.name, ...summarizeToolUse(b.name, b.input, worktree) })
+			}
 		} else if (b.type === 'tool_result' && b.is_error) {
 			// Successful results are noise on a phone; surface only failures.
 			flush()

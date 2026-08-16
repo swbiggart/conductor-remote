@@ -8,6 +8,7 @@ import { elapsed, messagePreview, messageTime } from '../lib/format.ts'
 import type { PendingPrompt, TranscriptEntry } from '../lib/types.ts'
 import type { PendingMessage } from '../store.ts'
 import { useApp } from '../store.ts'
+import { InputRequest } from './InputRequest.tsx'
 import { Markdown } from './Markdown.tsx'
 import { MessageNav } from './MessageNav.tsx'
 import { Empty, Spinner } from './ui.tsx'
@@ -27,7 +28,7 @@ export function Transcript({
 	/** The relay's undelivered first prompt for this workspace (src/firstprompt.ts). */
 	queued?: PendingPrompt | null
 }) {
-	const { entries, loading, error } = useTranscript(sessionId)
+	const { entries, pending: inputPending, loading, error } = useTranscript(sessionId)
 	const pending = useApp(s => s.pending)
 	const removePending = useApp(s => s.removePending)
 	const sendPrompt = useSendPrompt()
@@ -71,11 +72,11 @@ export function Transcript({
 		atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
 	}
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: fire on new entries, a new optimistic bubble, or the working indicator toggling to keep the view pinned
+	// biome-ignore lint/correctness/useExhaustiveDependencies: fire on new entries, a new optimistic bubble, an arriving question/plan card, or the working indicator toggling to keep the view pinned
 	useLayoutEffect(() => {
 		const el = scroller.current
 		if (el && atBottom.current) el.scrollTop = el.scrollHeight
-	}, [entries, visiblePending.length, working])
+	}, [entries, visiblePending.length, working, inputPending?.toolUseId])
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset scroll intent when switching sessions
 	useEffect(() => {
@@ -100,7 +101,7 @@ export function Transcript({
 	// waiting on that setup, showing it beats an empty pane that looks like a loss.
 	if (!sessionId && !showQueued) return <Empty>No active session in this workspace.</Empty>
 
-	const empty = entries.length === 0 && visiblePending.length === 0 && !showQueued
+	const empty = entries.length === 0 && visiblePending.length === 0 && !showQueued && !inputPending
 
 	return (
 		<div className="relative flex min-h-0 min-w-0 flex-1">
@@ -135,6 +136,16 @@ export function Transcript({
 								queued={showQueued}
 								onRetry={sessionId ? () => sendPrompt({ sessionId, workspaceId, text: showQueued.text }) : undefined}
 								onDismiss={() => dismiss(showQueued)}
+							/>
+						) : null}
+						{/* A sibling of the entry list, never inside groupSteps — a question the
+						    agent is waiting on must not fold into a closed "N steps" disclosure. */}
+						{inputPending && sessionId ? (
+							<InputRequest
+								key={inputPending.toolUseId}
+								pending={inputPending}
+								sessionId={sessionId}
+								workspaceId={workspaceId}
 							/>
 						) : null}
 						{working ? <WorkingIndicator since={workingSince} /> : null}

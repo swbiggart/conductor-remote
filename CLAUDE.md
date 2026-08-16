@@ -293,11 +293,19 @@ Two asymmetric halves — keep them separate:
     exactly like the composer draft it belongs to), and `useSendPrompt` POSTs the
     patch *before* the prompt and drops the prompt if it didn't stick — running it
     on the model the user just moved away from is the same class of mistake as
-    landing it in the wrong workspace. That's why staged pills are coloured, why
-    staging still works with the relay down, and why flipping a value back to
-    Conductor's own clears the staged one instead of queuing a no-op round trip
-    (`clearAgentDraft` clears key by key, so a change made *during* a send stages
-    for the next one instead of being swallowed). `GET …/models` is then the only
+    landing it in the wrong workspace. The pill grammar carries the distinction:
+    **fill = the value the next prompt runs with, dashed outline = staged** —
+    solid accent is reserved for Conductor's own state, so a staged-to-on pill
+    (tinted + dashed) can't read as already-on. (The old scheme — on as subtle
+    grey, staged as the brightest accent — made a plan-default chat's pill look
+    *off*; tapping it staged plan OFF while lighting up, the exact inversion of
+    what the tap meant.) Staging still works with the relay down, flipping a value
+    back to Conductor's own clears the staged one instead of queuing a no-op round
+    trip (`clearAgentDraft` clears key by key, so a change made *during* a send
+    stages for the next one instead of being swallowed), and a staged value the DB
+    has caught up with is dropped on the sessions poll (`reconcileAgentDrafts`) —
+    drafts persist in localStorage, so without that a value changed on the Mac
+    would keep the pill "staged" forever. `GET …/models` is then the only
     tap-time trip left, and it's the expensive one — it activates Conductor and
     opens the real menu — so its result is cached per `agent_type` and served
     stale-while-revalidate (`web/src/lib/models.ts` ▸ `useModels`): the picker
@@ -339,6 +347,29 @@ Two asymmetric halves — keep them separate:
     `query` send injects a real prompt into a running agent; never auto-run it to
     "test."** Since `applescript` is now precise, sidecar buys nothing today.
 
+- **"Waiting on you" is a read, not a signal** (`reads.pendingInput`). The schema
+  has no waiting flag, but an *idle* session whose transcript tail is an
+  interactive `tool_use` (`ExitPlanMode`, or `mcp__*__AskUserQuestion` — Conductor
+  routes questions through its MCP server, options as **plain strings**) with no
+  later row containing that tool_use id *is* the flag: the answer's `tool_result`
+  carries the same id, so a substring check on the id is a receipt that survives
+  any rewording of Claude Code's result text. It rides the open chat's 1s
+  `/messages` poll as `pending` (additive — a stale PWA ignores it), which is also
+  where the phone renders the question/plan card (`web/src/components/InputRequest.tsx`,
+  a *sibling* of the entry list so the step-group fold can never bury it) and where
+  the push notifier picks its wording. Answering goes through
+  `POST /api/sessions/:id/answer` → `writes.answerSession`: the same verified
+  focus path as a send, then an AXPress on the card's own button — validated
+  against the live pending read *before* pressing (a card answered on the Mac in
+  the meantime becomes a 409 or an idempotent `already:true`, never a press into a
+  changed conversation) and confirmed against the receipt after, so the press's
+  own exit code is advisory. Two deliberate narrowings: only single-choice,
+  single-question cards are answerable from the phone (multiSelect renders
+  read-only with a "answer on the Mac" hint until the card's Submit control is
+  AX-mapped), and **a locked Mac refuses instead of parking** — a parked
+  button-press firing hours later would land in a conversation that moved on. The
+  card's AX shape is undocumented, so `pressAnswerOption`/`pressApprovePlan` fail
+  with every pressable name they *did* see — the failure is the discovery dump.
 - **Notifications are a read that pushes** — the cheap third shape, on the durable
   side of the split. `src/notify.ts` polls the same read-only SQLite for
   `sessions.status` transitions and POSTs a Web Push message; no Conductor

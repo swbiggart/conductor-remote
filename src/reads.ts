@@ -5,7 +5,7 @@ import type { ConductorDb } from './db.ts'
 import type { FirstPrompt } from './firstprompt.ts'
 import { describeRepoIcon, type RepoIcon, type ResolvedIcon, resolveRepoIcon } from './icons.ts'
 import type { ParkedPrompt } from './parked.ts'
-import { parseMessage, type TranscriptEntry } from './transcript.ts'
+import { type PendingQuestion, parseMessage, type TranscriptEntry } from './transcript.ts'
 
 export interface WorkspaceRow {
 	id: string
@@ -79,6 +79,17 @@ export interface SessionRow {
 
 /** GitHub PR state of a workspace's branch, attached best-effort by src/pr.ts. */
 export type PrStatus = 'merged' | 'draft' | 'conflicts' | 'mergeable'
+
+/** A question or plan the agent is stopped on, derived from the transcript tail (see `pendingInput`). */
+export interface PendingInput {
+	kind: 'question' | 'plan'
+	toolUseId: string
+	/** rowid of the tool_use row — stable identity for the card and the answer validation. */
+	rowid: number
+	questions?: PendingQuestion[]
+	plan?: string
+	ts: string
+}
 
 /** One chat's live status, with enough context to name it in a notification (see src/notify.ts). */
 export interface SessionState {
@@ -374,6 +385,77 @@ export class Reads {
 			}
 		}
 		return null
+	}
+
+	/**
+	 * Is this chat stopped on a question or a plan waiting for the user? Derived
+	 * entirely from the transcript tail — the schema has no waiting flag, but an idle
+	 * session whose newest meaningful entry is an interactive tool_use with no
+	 * tool_result carrying the same id *is* the flag. Riding the per-chat messages
+	 * poll (1s, open chat only), so the tail scan stays cheap.
+	 */
+	pendingInput(sessionId: string): PendingInput | null {
+		// Mid-turn tool_use rows aren't pending input — `working → idle` is the turn
+		// boundary (see notify.ts). An 'error' turn's question died with it.
+		const status = this.db.query<{ status: string | null }>('SELECT status FROM sessions WHERE id = ? LIMIT 1', [
+			sessionId
+		])[0]?.status
+		if (status !== 'idle') return null
+		const rows = this.db.query<{
+			rowid: number
+			id: string
+			role: string | null
+			content: string | null
+			full_message: string | null
+			created_at: string
+			sent_at: string | null
+			queue_order: number | null
+		}>(
+			`SELECT rowid, id, role, content, full_message, created_at, sent_at, queue_order
+			 FROM session_messages
+			 WHERE session_id = ?
+			 ORDER BY rowid DESC
+			 LIMIT 30`,
+			[sessionId]
+		)
+		// Newest first: the first meaningful entry decides. A question buried under 30+
+		// bookkeeping rows fails closed to "nothing pending" — no card beats a stale card.
+		for (const row of rows) {
+			const entries = parseMessage(row, null)
+			for (let i = entries.length - 1; i >= 0; i--) {
+				const e = entries[i]
+				if (e.toolUseId && (e.tool === 'AskUserQuestion' || e.tool === 'ExitPlanMode')) {
+					if (this.answerRecorded(sessionId, e.toolUseId, row.rowid)) return null
+					return {
+						kind: e.tool === 'ExitPlanMode' ? 'plan' : 'question',
+						toolUseId: e.toolUseId,
+						rowid: row.rowid,
+						questions: e.questions,
+						plan: e.plan,
+						ts: e.ts
+					}
+				}
+				// Anything the user or agent did after a question supersedes it — including a
+				// failed tool_result, which is what a rejected plan leaves behind.
+				if (e.role === 'user' || e.role === 'assistant' || e.role === 'tool') return null
+			}
+		}
+		return null
+	}
+
+	/**
+	 * Has anything referencing this tool_use id landed after the question row? The
+	 * answer's tool_result frame carries the same id, so a plain substring check is
+	 * the drift-proof receipt — no dependence on Claude Code's result wording.
+	 */
+	answerRecorded(sessionId: string, toolUseId: string, sinceRowid: number): boolean {
+		const rows = this.db.query<{ found: number }>(
+			`SELECT 1 AS found FROM session_messages
+			 WHERE session_id = ? AND rowid > ? AND content LIKE '%' || ? || '%'
+			 LIMIT 1`,
+			[sessionId, sinceRowid, toolUseId]
+		)
+		return rows.length > 0
 	}
 
 	/** Session → worktree path, cached: it's stable for a session's lifetime and polled every tick. */

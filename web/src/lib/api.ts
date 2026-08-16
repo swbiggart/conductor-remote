@@ -186,6 +186,20 @@ export const client = {
 			{ method: 'POST', body: JSON.stringify({ repo, prompt }) },
 			ACTION_TIMEOUT_MS
 		),
+	/**
+	 * Answer the chat's pending question (one option label) or approve its pending
+	 * plan. The relay validates against the live pending read and confirms against
+	 * the transcript receipt, so re-sending after a lost response is safe.
+	 */
+	answer: (
+		sessionId: string,
+		body: { workspaceId: string; toolUseId: string; kind: 'question' | 'plan'; options?: string[]; approve?: boolean }
+	) =>
+		api<{ ok: boolean; already?: boolean; error?: string }>(
+			`/api/sessions/${encodeURIComponent(sessionId)}/answer`,
+			{ method: 'POST', body: JSON.stringify(body) },
+			ACTION_TIMEOUT_MS
+		),
 	/** Change a chat's model / effort / plan / fast via Conductor's own composer controls. */
 	setAgent: (sessionId: string, patch: AgentPatch, workspaceId: string) =>
 		api<AgentResult>(

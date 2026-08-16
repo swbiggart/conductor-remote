@@ -3,7 +3,7 @@ import { loadAgentDrafts, writeAgentDraft } from './lib/agentDraft.ts'
 import { bootstrapToken, clearToken, setStoredToken } from './lib/api.ts'
 import { loadDrafts, writeDraft } from './lib/draft.ts'
 import { loadReadMarks, type ReadMarks, writeReadMarks } from './lib/read.ts'
-import type { AgentPatch, UpdateStatus } from './lib/types.ts'
+import type { AgentPatch, Session, UpdateStatus } from './lib/types.ts'
 
 /** Sidebar view preferences — mirrors the desktop app's Group by / Repo / Sort by popover. */
 export type GroupBy = 'status' | 'repo' | 'none'
@@ -115,6 +115,8 @@ interface AppState {
 	stageAgent: (sessionId: string, patch: AgentPatch) => void
 	/** Drop the staged keys a send just applied — anything staged since survives. */
 	clearAgentDraft: (sessionId: string, applied: AgentPatch) => void
+	/** Drop staged keys the DB has caught up with — a staged value equal to Conductor's is a no-op patch. */
+	reconcileAgentDrafts: (sessions: Session[]) => void
 	/** Note a chat as seen up to `at` (its `updated_at`); older marks never overwrite newer ones. */
 	markRead: (sessionId: string, at: string) => void
 	setPush: (push: { deviceId: string | null; devices: number }) => void
@@ -189,6 +191,31 @@ export const useApp = create<AppState>((set, get) => {
 			})
 			writeAgentDraft(sessionId, next)
 			set({ agentDrafts: { ...get().agentDrafts, [sessionId]: next } })
+		},
+		// Drafts persist in localStorage, so a value changed on the Mac (or never sent)
+		// would otherwise keep the pill "staged" forever. Model is exempt: staged models
+		// are menu labels with no mapping to the DB's model ids (see AgentBar).
+		reconcileAgentDrafts: sessions => {
+			const drafts = get().agentDrafts
+			let changed = false
+			const next = { ...drafts }
+			for (const s of sessions) {
+				const d = drafts[s.id]
+				if (!d) continue
+				const pruned = prunePatch({
+					model: d.model,
+					effort: d.effort === (s.claude_effort_level ?? undefined) ? undefined : d.effort,
+					plan: d.plan === (s.permission_mode === 'plan') ? undefined : d.plan,
+					fast: d.fast === Boolean(s.fast_mode) ? undefined : d.fast
+				})
+				if (Object.keys(pruned).length === Object.keys(d).length) continue
+				writeAgentDraft(s.id, pruned)
+				next[s.id] = pruned
+				changed = true
+			}
+			// The sessions poll re-fires this every 2s; bail unless a key actually
+			// dropped, or every tick re-renders the composer (same as markRead).
+			if (changed) set({ agentDrafts: next })
 		},
 		setPush: push => set({ push }),
 		setSidebarOpen: sidebarOpen => set({ sidebarOpen }),

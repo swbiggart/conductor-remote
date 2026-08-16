@@ -842,17 +842,34 @@ on setEffort(wanted)
 	error "couldn't set effort to " & wanted
 end setEffort
 
+on planValue(box)
+	-- Normalize the checkbox's AXValue to a boolean. The old branches compared the
+	-- raw text against "0" asymmetrically, so a checkbox reporting true/false made
+	-- "turn plan on" silently no-op and "turn plan off" press it *on*. An unknown
+	-- spelling errors in words instead of guessing a direction.
+	tell application "System Events" to tell process "Conductor"
+		set v to value of box
+	end tell
+	set t to (v as text)
+	if t is "1" or t is "true" then return true
+	if t is "0" or t is "false" then return false
+	error "the Plan toggle's state read as " & quote & t & quote & " - expected 0/1/true/false"
+end planValue
+
 on setPlan(wanted)
 	set box to my controlNamed("Plan")
 	if box is missing value then error "couldn't find the Plan toggle"
-	tell application "System Events" to tell process "Conductor"
-		set current to ((value of box) as text)
-		if (wanted is "1" and current is "0") or (wanted is "0" and current is not "0") then
+	set target to (wanted is "1")
+	if (my planValue(box)) is not target then
+		tell application "System Events" to tell process "Conductor"
 			perform action "AXPress" of box
-			delay 0.4
-			if ((value of box) as text) is current then error "the Plan toggle didn't change"
-		end if
-	end tell
+		end tell
+		delay 0.4
+		-- Re-find: the webview re-render on toggle can stale the old handle.
+		set box to my controlNamed("Plan")
+		if box is missing value then error "the Plan toggle vanished after pressing"
+		if (my planValue(box)) is not target then error "the Plan toggle didn't change"
+	end if
 end setPlan
 
 on pressFast()
@@ -963,6 +980,108 @@ on applyAgentOptions()
 	if wantPlan is not "" then my setPlan(wantPlan)
 	if wantFast is "1" then my pressFast()
 end applyAgentOptions
+
+on chatPressables()
+	-- Every pressable control under the web area, walked depth-first with LATER
+	-- siblings first: the question/plan card renders at the bottom of the message
+	-- list, so a reverse walk reaches it before the transcript's thousands of
+	-- older rows. Both caps are load-bearing (the setWorkspaceStatus lesson — an
+	-- unbounded sweep of this tree costs more than the whole write): a card the
+	-- caps miss surfaces as "couldn't find", never as a wrong press.
+	set wa to my webArea()
+	set found to {}
+	set stack to {wa}
+	set visited to 0
+	repeat while (count of stack) > 0 and visited < 350
+		set node to item -1 of stack
+		if (count of stack) is 1 then
+			set stack to {}
+		else
+			set stack to items 1 thru -2 of stack
+		end if
+		set visited to visited + 1
+		repeat with k in (my axKids(node))
+			set kid to contents of k
+			set r to my axRole(kid)
+			if r is "AXButton" or r is "AXRadioButton" or r is "AXCheckBox" then
+				set end of found to kid
+			else if r is not "AXStaticText" and r is not "AXImage" and r is not "AXLink" and r is not "AXTextArea" and r is not "AXMenu" then
+				set end of stack to kid
+			end if
+		end repeat
+	end repeat
+	return found
+end chatPressables
+
+on matchControls(cands, wanted)
+	-- Exact name first; only if nothing is exact, a containing match (web buttons
+	-- sometimes carry appended text). Ambiguity is the caller's to refuse.
+	set hits to {}
+	repeat with c in cands
+		if (my axName(c)) is wanted then set end of hits to contents of c
+	end repeat
+	if (count of hits) > 0 then return hits
+	repeat with c in cands
+		if (my axName(c)) contains wanted then set end of hits to contents of c
+	end repeat
+	return hits
+end matchControls
+
+on pressableEvidence(cands)
+	-- The names actually on screen — a failed match must say what it saw, both for
+	-- the person retrying and because this is the discovery dump for a card shape
+	-- nothing documents.
+	set names to {}
+	repeat with c in cands
+		set n to my axName(c)
+		if n is not "" then set end of names to n
+	end repeat
+	return my joinList(names, " | ")
+end pressableEvidence
+
+on pressAnswerOption()
+	-- Answer the question card by pressing each requested option label, in order.
+	-- Landing the wrong answer is worse than not answering, so a missing or
+	-- ambiguous label aborts in words; the server's receipt check decides success.
+	set wanted to my splitLines(system attribute "RELAY_ANSWER_LABELS")
+	if (count of wanted) is 0 then error "no answer labels provided"
+	repeat with entry in wanted
+		set w to (entry as text)
+		if w is not "" then
+			set cands to my chatPressables()
+			set hits to my matchControls(cands, w)
+			if (count of hits) is 0 then error "couldn't find an option named " & quote & w & quote & " in the chat - controls seen: " & my pressableEvidence(cands)
+			if (count of hits) > 1 then error "more than one control matches " & quote & w & quote & " - refusing to guess"
+			tell application "System Events" to tell process "Conductor"
+				perform action "AXPress" of item 1 of hits
+			end tell
+			delay 0.5
+		end if
+	end repeat
+end pressAnswerOption
+
+on pressApprovePlan()
+	-- Approve the plan card: first unique hit among the candidate labels wins.
+	-- The labels ride in on the environment (RELAY_APPROVE_LABELS) so a Conductor
+	-- rename is a writes.ts edit, not a script hunt.
+	set cands to my chatPressables()
+	set wanted to my splitLines(system attribute "RELAY_APPROVE_LABELS")
+	repeat with entry in wanted
+		set w to (entry as text)
+		if w is not "" then
+			set hits to my matchControls(cands, w)
+			if (count of hits) is 1 then
+				tell application "System Events" to tell process "Conductor"
+					perform action "AXPress" of item 1 of hits
+				end tell
+				delay 0.5
+				return
+			end if
+			if (count of hits) > 1 then error "more than one control matches " & quote & w & quote & " - refusing to guess"
+		end if
+	end repeat
+	error "couldn't find the plan's approve button - controls seen: " & my pressableEvidence(cands)
+end pressApprovePlan
 
 on axRole(el)
 	tell application "System Events" to tell process "Conductor"

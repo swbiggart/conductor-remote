@@ -15,7 +15,10 @@
  *   three end the turn.
  * - `→ error` — the agent stopped badly.
  * There is no permission-request table to watch (verified against the schema), so
- * don't go looking for a finer-grained trigger; there isn't one.
+ * don't go looking for a finer-grained *trigger*; there isn't one. The *wording* is
+ * allowed one refinement: at fire time, `reads.pendingInput` (the transcript-tail
+ * read) can say the turn ended on a question or a plan — one extra tail query per
+ * notification, never per tick.
  *
  * Two properties worth keeping:
  * - **Transitions are confirmed one tick before they fire.** A status that
@@ -336,14 +339,21 @@ async function fire(
 ): Promise<void> {
 	const said = reads.lastAssistantText(sessionId)
 	const where = state.sessionTitle ? `${state.workspaceTitle} · ${state.sessionTitle}` : state.workspaceTitle
+	// working→idle is still the only trigger, but the transcript tail can say *why* the
+	// turn ended: one extra tail read per notification (not per tick), never per session.
+	const waiting = kind === 'done' ? reads.pendingInput(sessionId) : null
 	const body =
 		kind === 'error'
 			? said
 				? `Stopped with an error. ${oneLine(said)}`
 				: 'The agent stopped with an error.'
-			: said
-				? oneLine(said)
-				: 'Finished its turn.'
+			: waiting?.kind === 'question'
+				? oneLine(waiting.questions?.[0]?.question ?? 'Asked you a question.')
+				: waiting?.kind === 'plan'
+					? 'Plan ready for review.'
+					: said
+						? oneLine(said)
+						: 'Finished its turn.'
 	const sent = await notifyAll({
 		title: state.repoName ? `${where} — ${state.repoName}` : where,
 		body,
