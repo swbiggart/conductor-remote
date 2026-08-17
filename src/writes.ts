@@ -542,13 +542,24 @@ const APPROVE_LABELS = ['Approve plan', 'Approve']
  * function only ever presses a unique match, and errors in words otherwise.
  */
 export async function answerSession(target: SendTarget, action: AnswerAction): Promise<SendResult> {
+	// One built-in refocus-and-retry: the human clicking to another workspace
+	// between the focus and the scan is this write's observed failure mode (the
+	// scan then dumps the wrong pane's controls), and one refocus beats handing
+	// the phone an error for a race the next attempt wins anyway.
+	const press = action.kind === 'plan' ? 'my pressApprovePlan()' : 'my pressAnswerOption()'
 	const script = `
 ${CONDUCTOR_HANDLERS}
 
 my activateConductor()
 my focusWorkspace()
 my selectChatTab()
-${action.kind === 'plan' ? 'my pressApprovePlan()' : 'my pressAnswerOption()'}
+try
+	${press}
+on error firstErr
+	my focusWorkspace()
+	my selectChatTab()
+	${press}
+end try
 return "ok"`.trim()
 	try {
 		await uiTurn(() =>
@@ -565,6 +576,34 @@ return "ok"`.trim()
 		return { ok: true, strategy: 'applescript' }
 	} catch (err) {
 		return { ok: false, strategy: 'applescript', error: osaError(err) }
+	}
+}
+
+/**
+ * Diagnostic AX dump of whatever pane Conductor currently shows — role, name and
+ * description of everything under the web area, unnamed pressables included.
+ * Reads only, never presses, no activate (AX reads work on a background app).
+ * This is how an undocumented card shape (the answer/approve buttons) gets
+ * discovered from a shell that has no Automation grant of its own.
+ */
+export async function axDump(target?: SendTarget): Promise<{ ok: boolean; dump?: string; error?: string }> {
+	// With a target: the same verified focus path as a send, so the dump is of the
+	// chat in question rather than whatever pane the human left on screen.
+	const script = `
+${CONDUCTOR_HANDLERS}
+
+${target ? 'my activateConductor()\nmy focusWorkspace()\nmy selectChatTab()' : ''}
+return my axDump()`.trim()
+	try {
+		const { stdout } = await uiTurn(() =>
+			exec('osascript', ['-e', script], {
+				env: target ? { ...process.env, ...targetEnv(target) } : process.env,
+				timeout: 30000
+			})
+		)
+		return { ok: true, dump: stdout }
+	} catch (err) {
+		return { ok: false, error: osaError(err) }
 	}
 }
 

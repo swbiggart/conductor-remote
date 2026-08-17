@@ -30,6 +30,7 @@ import { driftWarningLines, tailscaleBin } from './tailscale.ts'
 import {
 	type AgentOptions,
 	answerSession,
+	axDump,
 	type ChatTab,
 	createWorkspace,
 	describeActuator,
@@ -40,6 +41,7 @@ import {
 	pickActuator,
 	retryWontHelp,
 	type SendResult,
+	type SendTarget,
 	screenLocked,
 	setAgentOptions,
 	setRestartGuard,
@@ -862,6 +864,24 @@ const server = http.createServer(async (req, res) => {
 			const applied = await applyAgentPatch(ws, sessionId, body)
 			if (!applied.ok) return json(req, res, 502, { ok: false, strategy: actuator.name, error: applied.error })
 			return json(req, res, 200, { ok: true, session: reads.listSessions(ws.id).find(s => s.id === sessionId) })
+		}
+
+		// GET /api/debug/ax — diagnostic dump of the visible pane's AX tree. Reads only;
+		// token-gated like /api/logs, and its output is user-screen text — same rule:
+		// don't log it, hand it back to whoever holds the token.
+		if (req.method === 'GET' && pathname === '/api/debug/ax') {
+			const wsId = url.searchParams.get('workspaceId')
+			const sessionId = url.searchParams.get('sessionId')
+			let target: SendTarget | undefined
+			if (wsId && sessionId) {
+				const ws = reads.getWorkspace(wsId)
+				if (!ws) return json(req, res, 404, { error: 'workspace not found' })
+				const located = locateChat(ws, sessionId)
+				if ('error' in located) return json(req, res, 409, { error: located.error })
+				target = { workspace: ws, sessionId, tab: located.tab }
+			}
+			const result = await axDump(target)
+			return json(req, res, result.ok ? 200 : 502, result)
 		}
 
 		// POST /api/sessions/:id/answer — press an option or Approve on the chat's

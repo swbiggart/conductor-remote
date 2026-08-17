@@ -394,12 +394,30 @@ Two asymmetric halves — keep them separate:
     sidecar stays off the default path; the locked Mac is its one honest niche.
 
 - **"Waiting on you" is a read, not a signal** (`reads.pendingInput`). The schema
-  has no waiting flag, but an *idle* session whose transcript tail is an
-  interactive `tool_use` (`ExitPlanMode`, or `mcp__*__AskUserQuestion` — Conductor
-  routes questions through its MCP server, options as **plain strings**) with no
-  later row containing that tool_use id *is* the flag: the answer's `tool_result`
+  has no waiting flag, but a session whose transcript tail is an interactive
+  `tool_use` (`ExitPlanMode`, or `mcp__*__AskUserQuestion` — Conductor routes
+  questions through its MCP server, options as **plain strings**) with no later
+  row containing that tool_use id *is* the flag: the answer's `tool_result`
   carries the same id, so a substring check on the id is a receipt that survives
-  any rewording of Claude Code's result text. It rides the open chat's 1s
+  any rewording of Claude Code's result text. **Deliberately no `status` gate**:
+  an interactive tool's result only ever comes from a human, so an unanswered one
+  at the tail means blocked regardless of status — and a plan actually waiting
+  sits at `needs_plan_response` and a waiting question at `needs_user_input` —
+  transient status values an `idle`-only gate filtered out (live incident
+  2026-08-17: the Approve card never showed for precisely the chats it was built
+  for). **The respond controls live in the pane header strip, not the
+  transcript** (all verified live): a waiting plan shows `AXButton
+  "Approve ⌘⇧↵"` (plus Hand off/Continue/Archive — the shortcut suffix is why
+  label matching must tolerate containment); a waiting question shows
+  `AXRadioButton`s named `"<n> <label>"` ("2 Green"), an `AXTextArea "Other
+  response"`, and an **unnamed** submit button — selection and submission are
+  separate controls, a radio press alone never produces the receipt, and the
+  submit can only be found by anchor: the sole button between the Other-response
+  box and the next splitter (`questionSubmitButton`). `GET /api/debug/ax`
+  (reads-only, token-gated) dumps role|name|description of the visible pane —
+  with `?workspaceId=&sessionId=` it focuses the chat first — and is how these
+  shapes were discovered; reach for it before guessing at any new control. The
+  pending read rides the open chat's 1s
   `/messages` poll as `pending` (additive — a stale PWA ignores it), which is also
   where the phone renders the question/plan card (`web/src/components/InputRequest.tsx`,
   a *sibling* of the entry list so the step-group fold can never bury it) and where
@@ -411,19 +429,25 @@ Two asymmetric halves — keep them separate:
   changed conversation) and confirmed against the receipt after, so the press's
   own exit code is advisory. Two deliberate narrowings: only single-choice,
   single-question cards are answerable from the phone (multiSelect renders
-  read-only with a "answer on the Mac" hint until the card's Submit control is
-  AX-mapped), and **a locked Mac refuses instead of parking** — a parked
-  button-press firing hours later would land in a conversation that moved on. The
-  card's AX shape is undocumented, so `pressAnswerOption`/`pressApprovePlan` fail
-  with every pressable name they *did* see — the failure is the discovery dump.
+  read-only with a "answer on the Mac" hint — the submit anchor is mapped now,
+  but a multi-select press sequence hasn't been verified live), and **a locked
+  Mac refuses instead of parking** — a parked button-press firing hours later
+  would land in a conversation that moved on. On any miss,
+  `pressAnswerOption`/`pressApprovePlan` fail with every pressable name they
+  *did* see — the failure is the discovery dump — and `answerSession` retries
+  once through a full refocus, because the one observed failure mode is the
+  human switching panes mid-scan.
 - **Notifications are a read that pushes** — the cheap third shape, on the durable
   side of the split. `src/notify.ts` polls the same read-only SQLite for
   `sessions.status` transitions and POSTs a Web Push message; no Conductor
-  process, no AX, no window. **`working → idle` is the whole trigger** — it is
-  what "done", "asked you a question" and "waiting on a permission prompt" all
-  look like, because each ends the turn — plus `→ error`. Don't hunt for a
-  finer-grained signal: the schema has no permission-request table (checked), and
-  `status` only ever holds `working`/`idle`/`error`. Two invariants keep it from
+  process, no AX, no window. **A turn ending is the whole trigger** (`working →`
+  any of `idle`/`needs_plan_response`/`needs_user_input` — see `turnEnded`) —
+  "done", "plan ready", "asked a question" and "waiting on a permission prompt"
+  all look like one, plus `→ error`. Don't hunt for a finer-grained signal: the
+  schema has no permission-request table (checked), and `status` holds exactly
+  those five values — **beware that a status can be transient**:
+  `needs_plan_response` and `needs_user_input` exist only while their wait does,
+  so a "verified" survey of stored values missed both for months. Two invariants keep it from
   being a nuisance: a transition must **survive one more tick** before it fires
   (a queued prompt restarting the turn would otherwise buzz for nothing), and the
   first tick after a device subscribes is a **baseline, not a broadcast** (else

@@ -389,18 +389,19 @@ export class Reads {
 
 	/**
 	 * Is this chat stopped on a question or a plan waiting for the user? Derived
-	 * entirely from the transcript tail — the schema has no waiting flag, but an idle
-	 * session whose newest meaningful entry is an interactive tool_use with no
-	 * tool_result carrying the same id *is* the flag. Riding the per-chat messages
-	 * poll (1s, open chat only), so the tail scan stays cheap.
+	 * entirely from the transcript tail — a session whose newest meaningful entry is
+	 * an interactive tool_use with no tool_result carrying the same id *is* the
+	 * flag. Deliberately no `sessions.status` gate: an interactive tool's result can
+	 * only come from a human, so an unanswered one at the tail means the agent is
+	 * blocked no matter what status says — and status lies here anyway. A plan
+	 * awaiting approval sits at `needs_plan_response`, a fourth value the schema
+	 * surveys never saw because it exists only while a plan is actually waiting;
+	 * the `=== 'idle'` gate this replaces returned null for exactly the sessions
+	 * the card was built for (live-observed 2026-08-17). The supersede scan below
+	 * plus the receipt check are what keep mid-turn rows out. Riding the per-chat
+	 * messages poll (1s, open chat only), so the tail scan stays cheap.
 	 */
 	pendingInput(sessionId: string): PendingInput | null {
-		// Mid-turn tool_use rows aren't pending input — `working → idle` is the turn
-		// boundary (see notify.ts). An 'error' turn's question died with it.
-		const status = this.db.query<{ status: string | null }>('SELECT status FROM sessions WHERE id = ? LIMIT 1', [
-			sessionId
-		])[0]?.status
-		if (status !== 'idle') return null
 		const rows = this.db.query<{
 			rowid: number
 			id: string

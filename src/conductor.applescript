@@ -1112,10 +1112,80 @@ on pressableEvidence(cands)
 	return my joinList(names, " | ")
 end pressableEvidence
 
+on questionSubmitButton()
+	-- The question card's submit is an UNNAMED icon button (discovered live), so it
+	-- can only be found by anchor: Conductor renders the options as radio buttons
+	-- followed by an "Other response" free-text area, and the submit is the sole
+	-- button between that text area and the next splitter. Anything other than
+	-- exactly one candidate errors rather than guesses.
+	set wa to my webArea()
+	set stack to {wa}
+	set visited to 0
+	repeat while (count of stack) > 0 and visited < 350
+		set node to item -1 of stack
+		if (count of stack) is 1 then
+			set stack to {}
+		else
+			set stack to items 1 thru -2 of stack
+		end if
+		set visited to visited + 1
+		set kidList to my axKids(node)
+		if (count of kidList) > 0 then
+			set roleList to {}
+			set nameList to {}
+			tell application "System Events" to tell process "Conductor"
+				try
+					set roleList to role of UI elements of node
+				end try
+				try
+					set nameList to name of UI elements of node
+				end try
+			end tell
+			set anchor to 0
+			repeat with i from 1 to (count of kidList)
+				set r to ""
+				try
+					set r to (item i of roleList) as text
+				end try
+				set n to ""
+				try
+					if (item i of nameList) is not missing value then set n to (item i of nameList) as text
+				end try
+				if r is "AXTextArea" and n is "Other response" then set anchor to i
+			end repeat
+			if anchor > 0 then
+				set hits to {}
+				repeat with i from (anchor + 1) to (count of kidList)
+					set r to ""
+					try
+						set r to (item i of roleList) as text
+					end try
+					if r is "AXSplitter" then exit repeat
+					if r is "AXButton" then set end of hits to (item i of kidList)
+				end repeat
+				if (count of hits) is 1 then return item 1 of hits
+				error "found the Other response box but " & (count of hits) & " candidate submit buttons beside it - refusing to guess"
+			end if
+			repeat with i from 1 to (count of kidList)
+				set r to ""
+				try
+					set r to (item i of roleList) as text
+				end try
+				if r is not "AXStaticText" and r is not "AXImage" and r is not "AXButton" and r is not "AXLink" and r is not "AXMenu" then set end of stack to (item i of kidList)
+			end repeat
+		end if
+	end repeat
+	return missing value
+end questionSubmitButton
+
 on pressAnswerOption()
-	-- Answer the question card by pressing each requested option label, in order.
-	-- Landing the wrong answer is worse than not answering, so a missing or
-	-- ambiguous label aborts in words; the server's receipt check decides success.
+	-- Answer the question card: press each requested option label (Conductor
+	-- renders them as radio buttons named "<n> <label>", so the containing match
+	-- in matchControls does the tolerating), then press the card's submit —
+	-- selection and submission are separate controls (verified live: a radio
+	-- press alone never produces the tool_result receipt). Landing the wrong
+	-- answer is worse than not answering, so a missing or ambiguous label aborts
+	-- in words; the server's receipt check decides success.
 	set wanted to my splitLines(system attribute "RELAY_ANSWER_LABELS")
 	if (count of wanted) is 0 then error "no answer labels provided"
 	repeat with entry in wanted
@@ -1131,7 +1201,68 @@ on pressAnswerOption()
 			delay 0.5
 		end if
 	end repeat
+	set submitBtn to my questionSubmitButton()
+	if submitBtn is missing value then error "selected the option but couldn't find the question's submit button"
+	tell application "System Events" to tell process "Conductor"
+		perform action "AXPress" of submitBtn
+	end tell
+	delay 0.5
 end pressAnswerOption
+
+on axDump()
+	-- Diagnostic: role|name for everything under the web area, unnamed pressables
+	-- included — the evidence dump that decides how answer handlers match. Reads
+	-- only; never presses. Properties are fetched in BULK per container (`role of
+	-- UI elements of node` is one Apple event for the whole sibling list) — the
+	-- per-node variant cost ~3 round trips × 900 nodes and blew the ceiling.
+	set wa to my webArea()
+	set out to {}
+	set queue to {wa}
+	set visited to 0
+	repeat while (count of queue) > 0 and visited < 250
+		set node to item 1 of queue
+		if (count of queue) is 1 then
+			set queue to {}
+		else
+			set queue to rest of queue
+		end if
+		set visited to visited + 1
+		set kidList to my axKids(node)
+		if (count of kidList) > 0 then
+			set roleList to {}
+			set nameList to {}
+			set descList to {}
+			tell application "System Events" to tell process "Conductor"
+				try
+					set roleList to role of UI elements of node
+				end try
+				try
+					set nameList to name of UI elements of node
+				end try
+				try
+					set descList to description of UI elements of node
+				end try
+			end tell
+			repeat with i from 1 to (count of kidList)
+				set r to ""
+				try
+					set r to (item i of roleList) as text
+				end try
+				set n to ""
+				try
+					if (item i of nameList) is not missing value then set n to (item i of nameList) as text
+				end try
+				set d to ""
+				try
+					if (item i of descList) is not missing value then set d to (item i of descList) as text
+				end try
+				set end of out to (visited as text) & ": " & r & " | " & n & " | " & d
+			end repeat
+		end if
+		set queue to queue & kidList
+	end repeat
+	return my joinList(out, linefeed)
+end axDump
 
 on pressApprovePlan()
 	-- Approve the plan card: first unique hit among the candidate labels wins.
