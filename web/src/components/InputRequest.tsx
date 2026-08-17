@@ -47,7 +47,7 @@ export function InputRequest({
 			{pending.kind === 'plan' ? (
 				<PlanBody pending={pending} busy={busy} onApprove={() => submit({ approve: true })} />
 			) : (
-				<QuestionBody pending={pending} busy={busy} onPick={label => submit({ options: [label] })} />
+				<QuestionBody pending={pending} busy={busy} onAnswer={labels => submit({ options: labels })} />
 			)}
 			{error ? (
 				<div className="flex items-center gap-2 border-t border-border-soft px-3.5 py-2 text-[11.5px] text-del">
@@ -71,20 +71,25 @@ function Header({ icon, children }: { icon: React.ReactNode; children: string })
 function QuestionBody({
 	pending,
 	busy,
-	onPick
+	onAnswer
 }: {
 	pending: PendingInput
 	busy: boolean
-	onPick: (label: string) => void
+	onAnswer: (labels: string[]) => void
 }) {
 	const questions = pending.questions ?? []
-	// v1 answers single-choice, single-question cards only; anything richer is
-	// shown read-only rather than half-answered (the relay refuses those too).
-	const answerable = questions.length === 1 && !questions[0].multiSelect
+	// Single-choice questions only (any count — the relay presses select+submit per
+	// question); multiSelect renders read-only until a live card maps its presses.
+	const answerable = questions.length > 0 && questions.every(q => !q.multiSelect)
+	const single = questions.length === 1
+	// Multi-question: picks stage locally (one per question) and go as one request —
+	// the relay walks Conductor's one-question-at-a-time strip in the same order.
+	const [picks, setPicks] = useState<Record<number, string>>({})
+	const complete = questions.every((_, i) => picks[i] !== undefined)
 	return (
 		<div className="flex flex-col gap-2 pb-3">
 			<Header icon={<CircleHelp size={12} />}>Waiting for your answer</Header>
-			{questions.map(q => (
+			{questions.map((q, qi) => (
 				<div key={q.question} className="flex flex-col gap-2 px-3.5">
 					{q.header ? <div className="text-[11px] font-medium text-faint">{q.header}</div> : null}
 					<div className="text-[14px] leading-relaxed">{q.question}</div>
@@ -94,9 +99,10 @@ function QuestionBody({
 								key={o.label}
 								type="button"
 								disabled={busy || !answerable}
-								onClick={() => onPick(o.label)}
+								onClick={() => (single ? onAnswer([o.label]) : setPicks(p => ({ ...p, [qi]: o.label })))}
 								className={cn(
-									'rounded-xl border border-border px-3 py-2 text-left text-[13.5px] transition',
+									'rounded-xl border px-3 py-2 text-left text-[13.5px] transition',
+									picks[qi] === o.label ? 'border-accent bg-accent-soft text-accent' : 'border-border',
 									answerable && 'active:scale-[0.985] active:bg-surface-2',
 									busy && 'opacity-50'
 								)}
@@ -108,6 +114,21 @@ function QuestionBody({
 					</div>
 				</div>
 			))}
+			{!single && answerable ? (
+				<div className="px-3.5">
+					<button
+						type="button"
+						disabled={busy || !complete}
+						onClick={() => onAnswer(questions.map((_, i) => picks[i]))}
+						className={cn(
+							'w-full rounded-xl bg-accent px-3 py-2.5 text-center text-[14px] font-semibold text-bg transition active:scale-[0.985]',
+							(busy || !complete) && 'opacity-50'
+						)}
+					>
+						{complete ? 'Send answers' : 'Pick one per question'}
+					</button>
+				</div>
+			) : null}
 			<Footer busy={busy}>
 				{answerable ? 'Or reply from the composer below.' : 'Answer this one in Conductor on your Mac.'}
 			</Footer>

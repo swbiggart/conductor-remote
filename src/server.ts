@@ -921,15 +921,19 @@ const server = http.createServer(async (req, res) => {
 			}
 			let labels: string[] = []
 			if (body.kind === 'question') {
-				const q = pending.questions?.[0]
-				if (!q || pending.questions?.length !== 1 || q.multiSelect) {
+				// One answer per question, in order — Conductor shows a multi-question card
+				// one question at a time, and the press sequence follows that.
+				const qs = pending.questions ?? []
+				if (!qs.length || qs.some(q => q.multiSelect)) {
 					return json(req, res, 400, {
 						error: 'only single-choice questions can be answered from the phone — answer this one in Conductor'
 					})
 				}
 				labels = body.options ?? []
-				if (labels.length !== 1 || !q.options.some(o => o.label === labels[0])) {
-					return json(req, res, 400, { error: 'the answer must be exactly one of the question’s own options' })
+				if (labels.length !== qs.length || labels.some((l, i) => !qs[i].options.some(o => o.label === l))) {
+					return json(req, res, 400, {
+						error: 'answers must be one option per question, each from that question’s own options'
+					})
 				}
 			} else if (!body.approve) {
 				return json(req, res, 400, {

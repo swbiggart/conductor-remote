@@ -1154,6 +1154,9 @@ on questionSubmitButton()
 				if r is "AXTextArea" and n is "Other response" then set anchor to i
 			end repeat
 			if anchor > 0 then
+				-- Multi-question cards put their nav buttons ("Previous question",
+				-- "Question 2", …) in the same span — all named. The submit is the
+				-- sole UNNAMED button, on every card shape seen live.
 				set hits to {}
 				repeat with i from (anchor + 1) to (count of kidList)
 					set r to ""
@@ -1161,10 +1164,16 @@ on questionSubmitButton()
 						set r to (item i of roleList) as text
 					end try
 					if r is "AXSplitter" then exit repeat
-					if r is "AXButton" then set end of hits to (item i of kidList)
+					if r is "AXButton" then
+						set n to ""
+						try
+							if (item i of nameList) is not missing value then set n to (item i of nameList) as text
+						end try
+						if n is "" then set end of hits to (item i of kidList)
+					end if
 				end repeat
 				if (count of hits) is 1 then return item 1 of hits
-				error "found the Other response box but " & (count of hits) & " candidate submit buttons beside it - refusing to guess"
+				error "found the Other response box but " & (count of hits) & " unnamed submit candidates beside it - refusing to guess"
 			end if
 			repeat with i from 1 to (count of kidList)
 				set r to ""
@@ -1188,6 +1197,22 @@ on pressAnswerOption()
 	-- in words; the server's receipt check decides success.
 	set wanted to my splitLines(system attribute "RELAY_ANSWER_LABELS")
 	if (count of wanted) is 0 then error "no answer labels provided"
+	-- One label per question, submitted per question: a multi-question card shows
+	-- ONE question's radios at a time and advances on submit, with "Question <n>"
+	-- nav buttons to jump between them (all verified live). Start from Question 1
+	-- — the strip holds its place, so whatever the Mac last looked at is where it
+	-- sits — then select-then-submit down the list; the receipt only exists after
+	-- the last one. A label the strip doesn't offer errors with evidence — which
+	-- is also what catches the card answered from the Mac mid-sequence.
+	if (count of wanted) > 1 then
+		set navHits to my matchControls(my chatPressables(), "Question 1")
+		if (count of navHits) is 1 then
+			tell application "System Events" to tell process "Conductor"
+				perform action "AXPress" of item 1 of navHits
+			end tell
+			delay 0.6
+		end if
+	end if
 	repeat with entry in wanted
 		set w to (entry as text)
 		if w is not "" then
@@ -1199,14 +1224,14 @@ on pressAnswerOption()
 				perform action "AXPress" of item 1 of hits
 			end tell
 			delay 0.5
+			set submitBtn to my questionSubmitButton()
+			if submitBtn is missing value then error "selected " & quote & w & quote & " but couldn't find the question's submit button"
+			tell application "System Events" to tell process "Conductor"
+				perform action "AXPress" of submitBtn
+			end tell
+			delay 0.7
 		end if
 	end repeat
-	set submitBtn to my questionSubmitButton()
-	if submitBtn is missing value then error "selected the option but couldn't find the question's submit button"
-	tell application "System Events" to tell process "Conductor"
-		perform action "AXPress" of submitBtn
-	end tell
-	delay 0.5
 end pressAnswerOption
 
 on axDump()

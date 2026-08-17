@@ -409,11 +409,15 @@ Two asymmetric halves — keep them separate:
   transcript** (all verified live): a waiting plan shows `AXButton
   "Approve ⌘⇧↵"` (plus Hand off/Continue/Archive — the shortcut suffix is why
   label matching must tolerate containment); a waiting question shows
-  `AXRadioButton`s named `"<n> <label>"` ("2 Green"), an `AXTextArea "Other
-  response"`, and an **unnamed** submit button — selection and submission are
-  separate controls, a radio press alone never produces the receipt, and the
-  submit can only be found by anchor: the sole button between the Other-response
-  box and the next splitter (`questionSubmitButton`). `GET /api/debug/ax`
+  ONE question at a time: `AXRadioButton`s named `"<n> <label>"` ("2 Green"), an
+  `AXTextArea "Other response"`, an **unnamed** submit button, and — multi-question
+  cards only — named nav buttons ("Previous question", "Question 2", …).
+  Selection and submission are separate controls, a radio press alone never
+  produces the receipt, submit advances to the next question, and the submit can
+  only be found by anchor: the sole *unnamed* button between the Other-response
+  box and the next splitter (`questionSubmitButton` — the named nav buttons share
+  that span). The press sequence is: jump to "Question 1", then select+submit per
+  answer, one label per question in order. `GET /api/debug/ax`
   (reads-only, token-gated) dumps role|name|description of the visible pane —
   with `?workspaceId=&sessionId=` it focuses the chat first — and is how these
   shapes were discovered; reach for it before guessing at any new control. The
@@ -427,11 +431,11 @@ Two asymmetric halves — keep them separate:
   against the live pending read *before* pressing (a card answered on the Mac in
   the meantime becomes a 409 or an idempotent `already:true`, never a press into a
   changed conversation) and confirmed against the receipt after, so the press's
-  own exit code is advisory. Two deliberate narrowings: only single-choice,
-  single-question cards are answerable from the phone (multiSelect renders
-  read-only with a "answer on the Mac" hint — the submit anchor is mapped now,
-  but a multi-select press sequence hasn't been verified live), and **a locked
-  Mac refuses instead of parking** — a parked button-press firing hours later
+  own exit code is advisory. Two deliberate narrowings: only single-choice
+  questions are answerable from the phone — any number of them per card, one
+  label each (multiSelect renders read-only with a "answer on the Mac" hint;
+  its press sequence hasn't been seen live) — and **a locked Mac refuses
+  instead of parking** — a parked button-press firing hours later
   would land in a conversation that moved on. On any miss,
   `pressAnswerOption`/`pressApprovePlan` fail with every pressable name they
   *did* see — the failure is the discovery dump — and `answerSession` retries
