@@ -130,14 +130,47 @@ function reloadAgent(): void {
 	launchctl('kickstart', '-k', `${domain}/${LABEL}`)
 }
 
-/** Node runs the relay via the flag-free CLI shim; the absolute execPath is baked at install time. */
+/**
+ * The relay's own private copy of node. macOS keys the Accessibility grant on
+ * the exact binary, so pointing the LaunchAgent at nvm/Homebrew node means
+ * every node upgrade (or a deploy run under a different version) silently
+ * revokes the grant — measured live 2026-08-18: a redeploy left every AX write
+ * refused. Copying node to a relay-owned path makes the grant survive both.
+ * The copy is refreshed only when the *running* node is a different version
+ * (`node --version` of the copy vs process.version), and a refresh is loudly
+ * announced because it re-requires the one-time grant.
+ */
+function privateNode(): string {
+	const binDir = path.join(os.homedir(), 'Library', 'Application Support', 'conductor-remote', 'bin')
+	const target = path.join(binDir, 'node')
+	let currentVersion: string | null = null
+	try {
+		currentVersion = execFileSync(target, ['--version'], { encoding: 'utf8' }).trim()
+	} catch {
+		currentVersion = null
+	}
+	if (currentVersion === process.version) return target
+	fs.mkdirSync(binDir, { recursive: true })
+	fs.copyFileSync(process.execPath, target)
+	fs.chmodSync(target, 0o755)
+	console.log(
+		currentVersion
+			? `  Refreshed the relay's private node (${currentVersion} → ${process.version}) — macOS will ask for the Accessibility grant again (System Settings ▸ Privacy & Security ▸ Accessibility ▸ ${target}).`
+			: `  Installed the relay's private node at ${target} (${process.version}) — grant it Accessibility once and future deploys/node upgrades keep it.`
+	)
+	return target
+}
+
+/** Node runs the relay via the flag-free CLI shim; the private-copy path is baked at install time. */
 function buildPlist(): string {
-	const node = xml(process.execPath)
+	const nodePath = privateNode()
+	const node = xml(nodePath)
 	const proj = xml(projectDir)
 	const out = xml(path.join(logDir, 'relay.log'))
 	const err = xml(path.join(logDir, 'relay.err.log'))
-	// node's own dir leads so the daemon can find `npm` (adjacent to node) for self-update under launchd's
-	// bare PATH; Homebrew's bin is appended for tailscale/node on Apple Silicon.
+	// The *source* node's dir leads so the daemon can find `npm` (adjacent to
+	// node, not copied) for self-update under launchd's bare PATH; Homebrew's
+	// bin is appended for tailscale/node on Apple Silicon.
 	const nodeDir = path.dirname(process.execPath)
 	const daemonPath = `${nodeDir}:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin`
 	// MANAGED marks this as the launchd-supervised instance: autoupdate.ts only self-restarts (exit →

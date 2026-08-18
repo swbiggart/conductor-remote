@@ -256,6 +256,13 @@ Two asymmetric halves — keep them separate:
     they were. Anything short of that (no window, which is also the locked and
     full-screen-Space case; wrong pane; no send button) returns false and the
     activation ladder takes over, so the fast path can only ever save disruption.
+    The card answer (`silentAnswer`) and agent settings (`silentApplyAgentOptions`)
+    have the same twin — the settings one **opts out when a model change is
+    requested**, because that opens the real picker menu and menus are the one AX
+    surface with known ghost behaviour (`closeMenus`), never probed from the
+    background. `newChat` can never join them: Cmd+T is its only mechanism
+    (measured — the strip's "+" ignores synthetic presses) and keystrokes need a
+    frontmost app.
     Queue deliveries additionally wait for idle hands (`waitForUserIdle` — a
     background send should never fight the human for the UI), as does the status
     write; a phone-initiated send stays immediate.
@@ -263,6 +270,23 @@ Two asymmetric halves — keep them separate:
     Landing in the wrong agent is worse than not sending, so every step errors out
     rather than guessing. No private protocol, nothing to rebreak on a Conductor
     update. The remaining keystroke delays (palette fallback) are load-bearing.
+
+    **`newChat` is the one operation with no Accessibility path, and that was
+    measured, not assumed.** Everything else here is AX reads and presses, which no
+    event tap sees; Cmd+T is the only mechanism this one has, so an input blocker
+    that swallows synthetic keystrokes takes it out entirely. The chat strip *does*
+    carry a "+" — the sole unnamed `AXButton` among the tab group's direct children
+    (the others are one `AXGroup` per tab), 24×24, immediately right of the last
+    tab, advertising `AXPress` — and **pressing it does nothing**: no tab, no
+    `sessions` row, no menu. Same for the unnamed `AXPopUpButton` beside it. That
+    isn't a dead pane: in the same run `AXPress` switches chat tabs and opens the
+    composer's model menu, so these two controls specifically ignore a synthetic
+    click (they read as pointer-event triggers). Conductor's File menu offers only
+    Close Window / Close All, so there is no menu command to press either. A real
+    mouse click at the button's coordinates would presumably work and is exactly
+    the wrong tool — a screen cover swallows clicks with its own overlay, so it
+    fails in the one case it would exist for. Reach for `GET /api/debug/ax` before
+    re-deriving any of this.
 
     **A failed send retries itself** (`deliverPrompt` in `server.ts`) — the phone
     should not be handed a Retry button for what is nearly always a warm-up cost.
@@ -312,6 +336,26 @@ Two asymmetric halves — keep them separate:
     readable state and only exists for some models**, so the DB decides whether to
     press it and a missing button is reported, not ignored. Every change is
     confirmed against the DB before the API returns success.
+
+    **Closing a menu is `AXCancel` first, Escape second** (`closeMenus`, used by
+    `listModels`, `setModel`'s no-match path and `dismissMenus`). Escape was the
+    only lever, and it is the only one an input blocker can eat — a screen cover
+    that swallows synthetic keystrokes leaves the picker open, and an open menu
+    swallows the *next* run's keystrokes. Every one of these menus advertises
+    `AXCancel`, which needs no event stream. **What you cannot do is check whether
+    it worked**: an `AXMenu` element that has been opened once *stays in the tree
+    for the life of the webview* — it survives Escape, `AXCancel` and a re-press of
+    its own trigger, keeping a real position and size and only shifting geometry.
+    So counting `AXMenu`s answers "has one ever been opened", not "is one open",
+    and a verify loop built on it fails forever: it burned every lever and
+    repeated every sweep on every call, turning a ~5s model refresh into 15-22s.
+    Hence one
+    cheap look (the count *does* drop to zero on the first close after a webview
+    load — the only evidence `AXCancel` lands), then Escape anyway, and **never a
+    re-press to "toggle it closed"**, which without a reliable read is as likely to
+    open a menu as close one. The handler returns which lever ran and the caller
+    logs it; the same reasoning is why `waitForMenuWith` identifies a menu by an
+    item it *contains* rather than by existing.
 
     **The phone doesn't push these on tap — the send does.** A tap only *stages*
     the change (`web/src/lib/agentDraft.ts`, keyed by session id and persisted
@@ -574,6 +618,11 @@ bind trap below), not by unit test.
   nothing. Keep logic *outside* the tell and reach in via one-line helpers
   (`tabLabel`, `paneLabels`), or name variables `strip`/`pane`. Nothing else in
   the toolchain reads this language, so run `yarn verify` after every edit.
+  **Some names are AppleScript's own and bite outside a tell too**: `named` and
+  `line` are reference forms, so `set named to {}` / `set line to …` fail to
+  compile at all ("Expected expression but found property or key form", and the
+  reported line number points at whatever came before) — `yarn verify` catches
+  these, which is most of why it exists.
   - **It is a real file, and that is load-bearing in two directions.** `writes.ts`
     reads it as a sibling of its own module (`import.meta.dirname`, the one place
     that may — see the `packageRoot()` rule below), so `yarn build:node` has to

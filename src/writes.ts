@@ -367,6 +367,22 @@ function targetEnv(target: SendTarget): Record<string, string> {
 	}
 }
 
+/**
+ * What a run said on stderr: the handlers' own `log` lines, which is how a step
+ * that *worked around* something reports it — today, which lever finally closed a
+ * menu. Not an error channel; osascript reports those through the exit code and
+ * `osaError` turns them into words. Capped: it becomes a log line, and log lines
+ * are a wire surface here.
+ */
+function scriptNote(stderr: string): string {
+	return stderr
+		.split('\n')
+		.map(s => s.trim())
+		.filter(Boolean)
+		.join('; ')
+		.slice(0, 300)
+}
+
 /** osascript echoes the whole failing script back; keep just the reason for the phone. */
 function osaError(err: unknown): string {
 	const raw = err instanceof Error ? err.message : String(err)
@@ -495,10 +511,12 @@ export async function setAgentOptions(target: SendTarget, opts: AgentOptions): P
 	const script = `
 ${CONDUCTOR_HANDLERS}
 
-my activateConductor()
-my focusWorkspace()
-my selectChatTab()
-my applyAgentOptions()
+if not (my silentApplyAgentOptions()) then
+	my activateConductor()
+	my focusWorkspace()
+	my selectChatTab()
+	my applyAgentOptions()
+end if
 return "ok"`.trim()
 	try {
 		await uiTurn(() =>
@@ -525,6 +543,13 @@ export interface AnswerAction {
 	kind: 'question' | 'plan'
 	/** Option labels to press, in order (one for single-select). Ignored for plan approval. */
 	labels: string[]
+	/**
+	 * Scraped (codex) card: select every question's label via the nav, then ONE
+	 * submit — a codex submit finalizes the whole card (measured live
+	 * 2026-08-18: a per-question submit resolved the unanswered questions to
+	 * their defaults). Claude cards keep the per-question submit path.
+	 */
+	scraped?: boolean
 }
 
 /**
@@ -541,33 +566,129 @@ const APPROVE_LABELS = ['Approve plan', 'Approve']
  * before this runs and confirms afterwards against the transcript receipt — this
  * function only ever presses a unique match, and errors in words otherwise.
  */
+/** The live question/plan card, scraped off the pane (see readInputCard). */
+export interface CardRead {
+	ok: boolean
+	/** 'question' | 'plan' | 'none' — none = no card on the pane right now. */
+	kind?: string
+	/**
+	 * One entry per question, each the full AX option names
+	 * ("1 <label> <description>"). Single-question cards have one entry.
+	 * Answers must send one option per question, verbatim, in order — a codex
+	 * submit finalizes the WHOLE card, so partial answers are never pressed.
+	 */
+	questions?: string[][]
+	/** Count of "Question N" nav buttons — >0 means a multi-question card. */
+	nav?: number
+	/** True when silentOnly was asked and the chat isn't the pane on screen. */
+	notVisible?: boolean
+	error?: string
+}
+
+/**
+ * Read the live card via AX — the only read that exists for codex sessions,
+ * whose cards never touch conductor.db. `silentOnly` never steals focus: it
+ * answers `notVisible` instead when the chat isn't the pane on screen, so the
+ * phone can ask permission before yanking the Mac around.
+ */
+export async function readInputCard(target: SendTarget, silentOnly: boolean): Promise<CardRead> {
+	const body = silentOnly
+		? 'return my silentReadInputCard()'
+		: `set got to my silentReadInputCard()
+if got is "unavailable" then
+	my activateConductor()
+	my focusWorkspace()
+	my selectChatTab()
+	set got to my readInputCard()
+end if
+return got`
+	const script = `
+${CONDUCTOR_HANDLERS}
+
+${body}`.trim()
+	try {
+		const { stdout } = await uiTurn(() =>
+			exec('osascript', ['-e', script], {
+				env: { ...process.env, ...targetEnv(target), RELAY_APPROVE_LABELS: APPROVE_LABELS.join('\n') },
+				timeout: SEND_ATTEMPT_MS
+			})
+		)
+		const lines = stdout.split('\n').map(s => s.trim())
+		switch (lines[0]) {
+			case 'unavailable':
+				return { ok: false, notVisible: true, error: 'the chat is not on screen on the Mac' }
+			case 'plan':
+				return { ok: true, kind: 'plan' }
+			case 'none':
+				return { ok: true, kind: 'none' }
+			case 'question': {
+				const nav = Number((lines[1] ?? '').replace('nav ', '')) || 0
+				// "q" starts a question's section; its options follow.
+				const questions: string[][] = []
+				for (const line of lines.slice(2)) {
+					if (line === 'q') questions.push([])
+					else if (line && questions.length) questions[questions.length - 1]?.push(line)
+				}
+				if (!questions.length || questions.some(q => !q.length)) {
+					return { ok: false, error: 'scraped a question card with an empty question — refusing to act on it' }
+				}
+				return { ok: true, kind: 'question', questions, nav }
+			}
+			default:
+				return { ok: false, error: `unexpected card read: ${lines[0] ?? '(empty)'}` }
+		}
+	} catch (err) {
+		return { ok: false, error: osaError(err) }
+	}
+}
+
 export async function answerSession(target: SendTarget, action: AnswerAction): Promise<SendResult> {
 	// One built-in refocus-and-retry: the human clicking to another workspace
 	// between the focus and the scan is this write's observed failure mode (the
 	// scan then dumps the wrong pane's controls), and one refocus beats handing
 	// the phone an error for a race the next attempt wins anyway.
-	const press = action.kind === 'plan' ? 'my pressApprovePlan()' : 'my pressAnswerOption()'
+	const press =
+		action.kind === 'plan'
+			? 'my pressApprovePlan()'
+			: action.scraped
+				? 'my pressScrapedAnswers()'
+				: 'my pressAnswerOption()'
+	// Silent fast path first (see silentAnswer): pane already right → press in
+	// the background, ~2s and no focus steal. Anything short of certainty falls
+	// through to the full activation ladder below.
 	const script = `
 ${CONDUCTOR_HANDLERS}
 
-my activateConductor()
-my focusWorkspace()
-my selectChatTab()
-try
-	${press}
-on error firstErr
+if not (my silentAnswer(${action.kind === 'plan' ? 'true' : 'false'})) then
+	my activateConductor()
 	my focusWorkspace()
 	my selectChatTab()
-	${press}
-end try
+	try
+		${press}
+	on error firstErr
+		my focusWorkspace()
+		my selectChatTab()
+		${press}
+	end try
+end if
 return "ok"`.trim()
+	// Labels ride a temp file, not the environment: AppleScript's
+	// `system attribute` decodes env bytes as MacRoman, so a non-ASCII label
+	// (an em-dash, live) mojibakes into a string no control matches. The file
+	// is read back with `do shell script cat`, which decodes UTF-8 — the same
+	// dodge deliverPrompt uses for the prompt text.
+	const os = await import('node:os')
+	const fs = await import('node:fs/promises')
+	const path = await import('node:path')
+	const tmp = path.join(os.tmpdir(), `relay-answer-${process.pid}-${Date.now()}.txt`)
+	await fs.writeFile(tmp, action.labels.join('\n'), 'utf8')
 	try {
 		await uiTurn(() =>
 			exec('osascript', ['-e', script], {
 				env: {
 					...process.env,
 					...targetEnv(target),
-					RELAY_ANSWER_LABELS: action.labels.join('\n'),
+					RELAY_ANSWER_FILE: tmp,
 					RELAY_APPROVE_LABELS: APPROVE_LABELS.join('\n')
 				},
 				timeout: SEND_ATTEMPT_MS
@@ -576,6 +697,8 @@ return "ok"`.trim()
 		return { ok: true, strategy: 'applescript' }
 	} catch (err) {
 		return { ok: false, strategy: 'applescript', error: osaError(err) }
+	} finally {
+		await fs.rm(tmp, { force: true }).catch(() => undefined)
 	}
 }
 
@@ -673,12 +796,17 @@ my focusWorkspace()
 my selectChatTab()
 return my listModels()`.trim()
 	try {
-		const { stdout } = await uiTurn(() =>
+		const { stdout, stderr } = await uiTurn(() =>
 			exec('osascript', ['-e', script], {
 				env: { ...process.env, ...targetEnv(target) },
 				timeout: SEND_ATTEMPT_MS
 			})
 		)
+		// How the picker got closed, from the handler's own `log`. Worth a line: the
+		// menu is opened for this read alone, and "only Escape closed it" is the early
+		// warning that an input blocker is eating the keystroke fallback.
+		const note = scriptNote(stderr)
+		if (note) console.log(`models: ${note}`)
 		const models = stdout
 			.split('\n')
 			.map(s => s.trim())
@@ -736,6 +864,31 @@ export async function createWorkspace(prompt: string, repoPath: string | null): 
  * Open a new chat in the target workspace — Conductor's "New chat, same files"
  * (Cmd+T). Focuses the workspace first (its own link, see `workspaceLink`), then
  * Cmd+T; the caller detects the freshly-created session id from the DB.
+ *
+ * **This is the one operation here with no Accessibility path, and it is not for
+ * want of looking.** Everything else in this file was made AX-first so that an
+ * input blocker — a screen cover that swallows synthetic keystrokes while agents
+ * keep working — can't take it out; new chat resisted, and the reasons are worth
+ * keeping because they look like bugs from a distance (all measured live through
+ * `GET /api/debug/ax` against Conductor 0.8x):
+ *  - The chat strip *does* carry a "+": the sole unnamed `AXButton` among the tab
+ *    group's direct children (the others are one `AXGroup` per tab), sitting 24×24
+ *    immediately right of the last tab. It advertises `AXPress`. **Pressing it does
+ *    nothing** — no new tab, no new `sessions` row, no menu, twice over. The
+ *    chevron beside it (an unnamed `AXPopUpButton` in the same row) ignores
+ *    `AXPress` the same way.
+ *  - That is not a dead pane or a stale handle: in the same run, `AXPress` on a
+ *    chat tab's own radio button switches tabs, and `AXPress` on the composer's
+ *    model picker opens its menu. So the row is drivable and these two controls
+ *    specifically are not — they read as trigger components wired to pointer
+ *    events, which `AXPress`'s synthetic click doesn't satisfy.
+ *  - There is no menu-bar command to fall back on: Conductor's File menu holds
+ *    only Close Window / Close All (its whole menu bar was enumerated).
+ * A real mouse click at the button's coordinates would presumably work, and is
+ * exactly the wrong tool: a screen cover swallows clicks with its own overlay, so
+ * it fails in the one case this would exist for — and it steals the pointer in
+ * every other case. So Cmd+T stays, and "new chat while locked" is a thing only
+ * the blocker's own keystroke passthrough can fix, not the relay.
  */
 export async function newChat(workspace: Workspace): Promise<SendResult> {
 	if (!focusQuery(workspace)) return { ok: false, strategy: 'applescript', error: 'workspace has no branch to focus' }

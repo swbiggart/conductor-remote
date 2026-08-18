@@ -799,6 +799,47 @@ on silentSend(promptText)
 	end try
 end silentSend
 
+on silentApplyAgentOptions()
+	-- silentSend's twin for the composer's agent controls. Effort, Plan and
+	-- Fast are plain AX presses that work from the background; a requested
+	-- model change opts out — it opens the real picker menu, and menus are
+	-- the one AX surface with known ghost behaviour (see closeMenus), never
+	-- probed from a background app. The ladder handles those.
+	if (system attribute "RELAY_SET_MODEL") is not "" then return false
+	try
+		if not (my hasWindow()) then return false
+		if not (my atTargetWorkspace()) then return false
+		my selectChatTab()
+		my applyAgentOptions()
+		return true
+	on error
+		return false
+	end try
+end silentApplyAgentOptions
+
+on silentAnswer(kindIsPlan)
+	-- silentSend's twin for the question/plan card: when Conductor already shows
+	-- the target chat, the card's buttons press fine from the background — no
+	-- activate, no stolen focus. Any surprise (no window — also the locked and
+	-- full-screen-Space case — wrong pane, missing card) returns false and the
+	-- activation ladder takes over, so this only ever saves disruption. The
+	-- press handlers' own label-mismatch errors are swallowed here and re-raised
+	-- with evidence by the ladder's run — same failure, better words.
+	try
+		if not (my hasWindow()) then return false
+		if not (my atTargetWorkspace()) then return false
+		my selectChatTab()
+		if kindIsPlan then
+			my pressApprovePlan()
+		else
+			my pressAnswerOption()
+		end if
+		return true
+	on error
+		return false
+	end try
+end silentAnswer
+
 on selectChatTab()
 	set wantIndex to (system attribute "RELAY_TAB_INDEX") as integer
 	if wantIndex is 0 then return
@@ -990,7 +1031,7 @@ on setModel(wanted)
 	if chosen is missing value and (count of badged) is 1 then set chosen to item 1 of badged
 	if chosen is missing value and (count of loose) is 1 then set chosen to item 1 of loose
 	if chosen is missing value then
-		tell application "System Events" to key code 53
+		log "setModel: closed the picker via " & my closeMenus(2)
 		if (count of loose) > 1 or (count of badged) > 1 then error "several models match " & wanted
 		error "no model named " & wanted
 	end if
@@ -1035,7 +1076,9 @@ on listModels()
 			end repeat
 		end repeat
 	end tell
-	tell application "System Events" to key code 53
+	-- The picker's only close. Escape alone left it standing whenever something
+	-- swallowed the keystroke, and the next run inherited an open menu.
+	log "listModels: closed the picker via " & my closeMenus(2)
 	set saved to AppleScript's text item delimiters
 	set AppleScript's text item delimiters to linefeed
 	set joined to labels as text
@@ -1187,6 +1230,120 @@ on questionSubmitButton()
 	return missing value
 end questionSubmitButton
 
+on scrapeCurrentOptions()
+	-- The displayed question's options: AXRadioButtons named "<digit> …" — the
+	-- leading digit is the discriminator against every other radio in the pane.
+	set opts to {}
+	repeat with c in my chatPressables()
+		if (my axRole(c)) is "AXRadioButton" then
+			set n to my axName(c)
+			if n is not "" and "0123456789" contains (character 1 of n) then set end of opts to n
+		end if
+	end repeat
+	return opts
+end scrapeCurrentOptions
+
+on pressNavButton(navLabel)
+	-- Question nav presses change which question is DISPLAYED, never an answer
+	-- (verified live) — which is what makes a full-card scrape a read.
+	set hits to my matchControls(my chatPressables(), navLabel)
+	if (count of hits) is not 1 then error "couldn't find the " & quote & navLabel & quote & " button"
+	tell application "System Events" to tell process "Conductor"
+		perform action "AXPress" of item 1 of hits
+	end tell
+	delay 0.45
+end pressNavButton
+
+on readInputCard()
+	-- Scrape the live question/plan card off the pane: the read for agents
+	-- (codex) whose cards never reach conductor.db at all (verified live
+	-- 2026-08-18 — the DB has no row; only AX can see the card). A
+	-- multi-question card is walked question-by-question via its nav buttons
+	-- (display-only presses) so EVERY question's options come back — the
+	-- caller must collect one answer per question before anything submits,
+	-- because a codex submit finalizes the whole card at once. Output:
+	-- "question" / "nav <n>" / per question a "q" line then its options; or
+	-- "plan"; or "none".
+	set cands to my chatPressables()
+	set navCount to 0
+	set hasApprove to false
+	set approveLabels to my splitLines(system attribute "RELAY_APPROVE_LABELS")
+	repeat with c in cands
+		set r to my axRole(c)
+		set n to my axName(c)
+		if r is "AXButton" and n is not "" then
+			if n starts with "Question " then set navCount to navCount + 1
+			repeat with entry in approveLabels
+				if (entry as text) is not "" and n is (entry as text) then set hasApprove to true
+			end repeat
+		end if
+	end repeat
+	set firstOpts to my scrapeCurrentOptions()
+	if (count of firstOpts) is 0 then
+		if hasApprove then return "plan"
+		return "none"
+	end if
+	if navCount is 0 then
+		return "question" & linefeed & "nav 0" & linefeed & "q" & linefeed & my joinList(firstOpts, linefeed)
+	end if
+	set out to "question" & linefeed & "nav " & navCount
+	repeat with q from 1 to navCount
+		my pressNavButton("Question " & q)
+		set out to out & linefeed & "q" & linefeed & my joinList(my scrapeCurrentOptions(), linefeed)
+	end repeat
+	-- Come home so the card is left where answering (or the human) expects it.
+	my pressNavButton("Question 1")
+	return out
+end readInputCard
+
+on selectScrapedOption(labelText)
+	set hits to my matchControls(my chatPressables(), labelText)
+	if (count of hits) is not 1 then error "option " & quote & labelText & quote & " is missing or ambiguous - controls seen: " & my pressableEvidence(my chatPressables())
+	tell application "System Events" to tell process "Conductor"
+		perform action "AXPress" of item 1 of hits
+	end tell
+	delay 0.3
+end selectScrapedOption
+
+on pressScrapedAnswers()
+	-- One submit finishes the WHOLE codex card (measured live 2026-08-18:
+	-- submitting with only question 1 answered resolved questions 2 and 3 to
+	-- their recommended defaults — codex cards are not Claude's
+	-- advance-per-submit). So: select every question's radio via the nav
+	-- first, and only then press submit, exactly once.
+	set wanted to my splitLines(do shell script "cat " & quoted form of (system attribute "RELAY_ANSWER_FILE"))
+	if (count of wanted) is 0 then error "no answer labels provided"
+	if (count of wanted) is 1 then
+		my selectScrapedOption(item 1 of wanted)
+	else
+		repeat with q from 1 to (count of wanted)
+			my pressNavButton("Question " & q)
+			my selectScrapedOption(item q of wanted)
+		end repeat
+	end if
+	set submitBtn to my questionSubmitButton()
+	if submitBtn is missing value then error "couldn't find the submit button"
+	tell application "System Events" to tell process "Conductor"
+		perform action "AXPress" of submitBtn
+	end tell
+	delay 0.6
+end pressScrapedAnswers
+
+on silentReadInputCard()
+	-- silentSend's twin for the card scrape: pane already right -> read from
+	-- the background, no activate, no stolen focus. "unavailable" (not an
+	-- error) tells the caller the chat isn't on screen, so an opt-in silent
+	-- read can answer 409 instead of yanking the Mac's focus.
+	try
+		if not (my hasWindow()) then return "unavailable"
+		if not (my atTargetWorkspace()) then return "unavailable"
+		my selectChatTab()
+		return my readInputCard()
+	on error
+		return "unavailable"
+	end try
+end silentReadInputCard
+
 on pressAnswerOption()
 	-- Answer the question card: press each requested option label (Conductor
 	-- renders them as radio buttons named "<n> <label>", so the containing match
@@ -1195,7 +1352,10 @@ on pressAnswerOption()
 	-- press alone never produces the tool_result receipt). Landing the wrong
 	-- answer is worse than not answering, so a missing or ambiguous label aborts
 	-- in words; the server's receipt check decides success.
-	set wanted to my splitLines(system attribute "RELAY_ANSWER_LABELS")
+	-- Labels arrive via a temp file, NOT an env var: `system attribute` decodes
+	-- env bytes as MacRoman, so any non-ASCII label (an em-dash was the live
+	-- failure) mojibakes and never matches. `do shell script` output is UTF-8.
+	set wanted to my splitLines(do shell script "cat " & quoted form of (system attribute "RELAY_ANSWER_FILE"))
 	if (count of wanted) is 0 then error "no answer labels provided"
 	-- One label per question, submitted per question: a multi-question card shows
 	-- ONE question's radios at a time and advances on submit, with "Question <n>"
@@ -1392,14 +1552,65 @@ on waitForMenuWith(root, maxDepth, itemName, attempts)
 	return missing value
 end waitForMenuWith
 
-on dismissMenus()
-	-- Two escapes: one for the submenu, one for the row menu. Leaving either open
-	-- would swallow the next run's keystrokes.
+on closeMenus(maxDepth)
+	-- Close whatever menu is open, AX first and keystroke second. Escape used to be
+	-- the only lever, and it is the one lever an input blocker can eat: a screen
+	-- cover that swallows synthetic keys (MeatLock and friends) leaves the menu
+	-- standing, and a menu left open is not cosmetic — it swallows the next run's
+	-- keystrokes. `AXCancel` is on every one of these menus (read from the live
+	-- element's own action list) and needs no event stream at all, so it goes first.
+	--
+	-- **Whether it worked is not knowable from here, and the tree is why.** An
+	-- AXMenu element that has been opened once *stays in the tree for the life of
+	-- the webview*: after Escape, after AXCancel, after re-pressing its trigger, the
+	-- element is still there with a real position and size, only its geometry
+	-- shifts (measured live, both states large). So "count the AXMenus" answers
+	-- "has one ever been opened", not "is one open", and a verify loop built on it
+	-- reports failure forever — which is exactly what it did: every lever burned
+	-- and every sweep repeated on every call, turning a ~5s model refresh into
+	-- 15-22s. The one time the count *does* fall to zero is the first close after
+	-- the webview loads, and that close was an AXCancel — the only direct evidence
+	-- this lever works at all.
+	--
+	-- So: cancel, look once (cheap, and honest about what it can prove), and press
+	-- Escape anyway when the element is still there. Never poll, and never re-press
+	-- the trigger to "toggle it closed" — with no reliable open/closed read that is
+	-- as likely to *open* a menu as to close one.
+	--
+	-- maxDepth is the caller's, for the same reason every sweep here is capped: the
+	-- transcript hangs off this root. The model picker is a direct child of the web
+	-- area (2); the workspace row menu is a portal a few levels in (4, what
+	-- waitForMenuWith uses).
+	--
+	-- Returns "none" (nothing there), "cancel" (confirmed gone) or "escape" (sent
+	-- the keystroke because it couldn't be confirmed) for the caller to log.
+	set wa to my webArea()
+	set found to my menusUnder(wa, maxDepth)
+	if (count of found) is 0 then return "none"
+	repeat with entry in found
+		set node to contents of entry
+		if "AXCancel" is in (my axActions(node)) then
+			try
+				tell application "System Events" to tell process "Conductor"
+					perform action "AXCancel" of node
+				end tell
+			end try
+		end if
+	end repeat
+	delay 0.35
+	if (count of my menusUnder(wa, maxDepth)) is 0 then return "cancel"
 	tell application "System Events"
 		key code 53
 		delay 0.25
 		key code 53
 	end tell
+	return "escape"
+end closeMenus
+
+on dismissMenus()
+	-- The submenu and the row menu it nests in, both — closeMenus cancels every menu
+	-- it finds and keeps the double Escape this handler always sent.
+	return my closeMenus(4)
 end dismissMenus
 
 on axActions(el)
@@ -1541,9 +1752,13 @@ on setWorkspaceStatus()
 		end try
 	end tell
 	delay 0.4
-	-- Clear anything already open (a picker, or a menu a previous run left behind)
-	-- so the sweep below can only match the one this right-click draws.
-	tell application "System Events" to key code 53
+	-- Clear anything already open (a picker, or a menu a previous run left behind) so
+	-- the sweep below can only match the one this right-click draws. Depth 2, not the
+	-- 4 the sweep below uses: this runs *before* the row menu exists, so a leftover
+	-- picker (a direct child of the web area) is all it can usefully find, and a
+	-- depth-4 sweep is the expensive kind — it walks the transcript, which hangs off
+	-- this same root and grows all session. The Escape inside closeMenus still fires.
+	my closeMenus(2)
 	delay 0.3
 	tell application "System Events" to tell process "Conductor"
 		perform action "AXShowMenu" of theRow

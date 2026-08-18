@@ -39,6 +39,7 @@ import {
 	lockBlocked,
 	newChat,
 	pickActuator,
+	readInputCard,
 	retryWontHelp,
 	type SendResult,
 	type SendTarget,
@@ -816,6 +817,27 @@ const server = http.createServer(async (req, res) => {
 		// fallback whenever the catalog can't answer (an `acp` chat, an unparseable
 		// binary). `models` stays a plain label list for older clients; `entries`
 		// carries the ids new clients stage (additive — a stale PWA ignores it).
+		// GET /api/sessions/:id/card?workspaceId=&silent=1 — scrape the live
+		// question/plan card via AX. This read exists because codex sessions'
+		// cards never touch conductor.db (verified live 2026-08-18): the pane is
+		// the only place they exist. On-demand only — never polled. `silent=1`
+		// never steals focus: it answers 409 {notVisible:true} when the chat
+		// isn't the pane on screen, so the phone asks before yanking the Mac.
+		m = pathname.match(/^\/api\/sessions\/([^/]+)\/card$/)
+		if (req.method === 'GET' && m) {
+			const sessionId = decodeURIComponent(m[1])
+			const ws = reads.getWorkspace(url.searchParams.get('workspaceId') ?? '')
+			if (!ws) return json(req, res, 404, { error: 'workspace for session not found' })
+			const located = locateChat(ws, sessionId)
+			if ('error' in located) return json(req, res, 409, { error: located.error })
+			const card = await readInputCard(
+				{ workspace: ws, sessionId, tab: located.tab },
+				url.searchParams.get('silent') === '1'
+			)
+			if (!card.ok) return json(req, res, card.notVisible ? 409 : 502, card)
+			return json(req, res, 200, card)
+		}
+
 		m = pathname.match(/^\/api\/sessions\/([^/]+)\/models$/)
 		if (req.method === 'GET' && m) {
 			const sessionId = decodeURIComponent(m[1])
@@ -896,9 +918,11 @@ const server = http.createServer(async (req, res) => {
 				kind?: 'question' | 'plan'
 				options?: string[]
 				approve?: boolean
+				/** Codex path: validate against a fresh AX scrape, not the DB read. */
+				scraped?: boolean
 			}
-			if (!body.toolUseId || (body.kind !== 'question' && body.kind !== 'plan')) {
-				return json(req, res, 400, { error: 'toolUseId and kind are required' })
+			if ((!body.toolUseId && !body.scraped) || (body.kind !== 'question' && body.kind !== 'plan')) {
+				return json(req, res, 400, { error: 'toolUseId (or scraped:true) and kind are required' })
 			}
 			const ws = body.workspaceId
 				? reads.getWorkspace(body.workspaceId)
@@ -906,6 +930,65 @@ const server = http.createServer(async (req, res) => {
 			if (!ws) return json(req, res, 404, { error: 'workspace for session not found' })
 			const located = locateChat(ws, sessionId)
 			if ('error' in located) return json(req, res, 409, { error: located.error })
+			if (body.scraped) {
+				// Codex sessions: the card has no DB row (nothing to validate a
+				// toolUseId against and no transcript receipt after), so both
+				// halves ride the scrape — the label must be on the card *now*,
+				// and success = the card visibly changed after the press.
+				const target = { workspace: ws, sessionId, tab: located.tab }
+				const before = await readInputCard(target, false)
+				if (!before.ok) return json(req, res, 502, before)
+				if (body.kind === 'plan') {
+					if (before.kind !== 'plan') {
+						return json(req, res, 409, {
+							ok: false,
+							error: 'no plan card on the pane anymore — it may have been answered on the Mac'
+						})
+					}
+					if (!body.approve) return json(req, res, 400, { error: 'plan answers support approve only' })
+				} else {
+					const labels = body.options ?? []
+					const questions = before.questions ?? []
+					if (before.kind !== 'question' || !questions.length) {
+						return json(req, res, 409, {
+							ok: false,
+							error: 'no question card on the pane anymore — it may have been answered on the Mac'
+						})
+					}
+					// ALL questions, or nothing: a codex submit finalizes the whole
+					// card, so a partial answer would silently default the rest —
+					// exactly the live incident this guard exists to prevent.
+					if (labels.length !== questions.length || labels.some((l, i) => !questions[i]?.includes(l))) {
+						return json(req, res, 400, {
+							error: `send one option per question (${questions.length}), each verbatim from the scraped card`
+						})
+					}
+				}
+				const pressed = await answerSession(target, { kind: body.kind, labels: body.options ?? [], scraped: true })
+				if (!pressed.ok && lockBlocked(pressed.error)) {
+					return json(req, res, 409, {
+						ok: false,
+						strategy: pressed.strategy,
+						error: 'The Mac is locked — unlock it to answer, or reply from the Mac.'
+					})
+				}
+				// The receipt is the card itself: gone, or advanced to the next
+				// question, means the press landed regardless of what it reported.
+				const after = await readInputCard(target, false)
+				const changed =
+					after.ok &&
+					(after.kind !== before.kind ||
+						JSON.stringify(after.questions ?? []) !== JSON.stringify(before.questions ?? []))
+				if (changed) return json(req, res, 200, { ok: true, card: after })
+				return json(req, res, 502, {
+					ok: false,
+					error: pressed.ok
+						? 'the press did not change the card — try again or answer on the Mac'
+						: (pressed.error ?? 'press failed')
+				})
+			}
+			// Non-scraped from here on: the DB read is the validator and the receipt.
+			if (!body.toolUseId) return json(req, res, 400, { error: 'toolUseId is required' })
 			// Fail closed against the live read: a card answered on the Mac between the
 			// phone's poll and this POST must become a refusal (or an idempotent ok),
 			// never a press against whatever the chat shows now.
