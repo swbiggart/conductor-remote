@@ -1,27 +1,68 @@
 import ConductorKit
 import SwiftUI
 
-/// Settings ▸ Appearance ▸ Text size: an app-wide Dynamic Type override.
-/// `system` (nil) follows the device's own setting; the rest pin a size, which
-/// scales every screen because the whole app uses relative fonts.
+/// Settings ▸ Appearance ▸ Text size. Two different meanings by surface, on
+/// purpose: the **transcript** follows it as a Dynamic Type pin (system
+/// default, one larger, two smaller), while the **workspace list** keeps
+/// system-size text and answers the smaller settings with *density* — tighter
+/// padding, smaller avatar — because shrinking a list you scan at a glance
+/// helps less than fitting more of it on screen.
 enum TextScale: String, CaseIterable {
-	case compact, system, large, extraLarge
+	case large, system, small, extraSmall
 
 	var label: String {
 		switch self {
-		case .compact: "Compact"
-		case .system: "System"
 		case .large: "Large"
-		case .extraLarge: "Extra large"
+		case .system: "System"
+		case .small: "Small"
+		case .extraSmall: "Extra small"
 		}
 	}
 
+	/// The transcript's Dynamic Type pin; nil = follow the device.
 	var dynamicTypeSize: DynamicTypeSize? {
 		switch self {
-		case .compact: .small
-		case .system: nil
 		case .large: .xLarge
-		case .extraLarge: .xxxLarge
+		case .system: nil
+		case .small: .medium
+		case .extraSmall: .small
+		}
+	}
+
+	/// How much the workspace list tightens at this setting.
+	var listDensity: ListDensity {
+		switch self {
+		case .large, .system: .regular
+		case .small: .compact
+		case .extraSmall: .tight
+		}
+	}
+}
+
+enum ListDensity {
+	case regular, compact, tight
+
+	var avatarSize: CGFloat {
+		switch self {
+		case .regular: 36
+		case .compact: 32
+		case .tight: 28
+		}
+	}
+
+	var rowVerticalPadding: CGFloat {
+		switch self {
+		case .regular: 4
+		case .compact: 2
+		case .tight: 0
+		}
+	}
+
+	var rowSpacing: CGFloat {
+		switch self {
+		case .regular: 10
+		case .compact: 8
+		case .tight: 8
 		}
 	}
 }

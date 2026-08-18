@@ -24,16 +24,21 @@ struct WorkspaceListView: View {
 			}
 			let groups = organize()
 			ForEach(groups, id: \.key) { group in
-				Section {
-					if !collapsed.contains(group.key) {
-						ForEach(group.workspaces) { workspace in
-							WorkspaceRow(workspace: workspace)
-								.tag(workspace.id)
-						}
-					}
-				} header: {
-					if groups.count > 1 || group.key != "all" {
-						groupHeader(group)
+				// Headers are plain rows, not Section headers — the system
+				// header chrome carried most of the vertical padding.
+				if groups.count > 1 || group.key != "all" {
+					groupHeader(group)
+						.listRowBackground(Color.appBackground)
+						.listRowSeparator(.hidden)
+						.listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 2, trailing: 16))
+						.selectionDisabled()
+				}
+				// A repo filter means "show me this repo's workspaces" — a
+				// stale collapsed group must never hide what was asked for.
+				if !repoFilter.isEmpty || !collapsed.contains(group.key) {
+					ForEach(group.workspaces) { workspace in
+						WorkspaceRow(workspace: workspace)
+							.tag(workspace.id)
 					}
 				}
 			}
@@ -115,6 +120,7 @@ struct WorkspaceListView: View {
 
 	private func groupHeader(_ group: WorkspaceGroup) -> some View {
 		Button {
+			guard repoFilter.isEmpty else { return }
 			withAnimation(.spring(duration: 0.35)) {
 				if collapsed.contains(group.key) {
 					collapsed.remove(group.key)
@@ -144,6 +150,7 @@ struct WorkspaceListView: View {
 					.font(.caption2.weight(.semibold))
 					.foregroundStyle(.tertiary)
 					.rotationEffect(.degrees(collapsed.contains(group.key) ? -90 : 0))
+					.opacity(repoFilter.isEmpty ? 1 : 0)
 			}
 		}
 		.buttonStyle(.plain)

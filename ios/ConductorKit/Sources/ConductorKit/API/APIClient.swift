@@ -203,6 +203,46 @@ public actor APIClient {
 			bodyCarriesErrors: true)
 	}
 
+	/// Answer the chat's pending question (one option label per question, in
+	/// order) or approve its pending plan. The relay validates against the live
+	/// pending read before pressing anything and confirms against the
+	/// transcript receipt after, so re-sending after a lost response is safe
+	/// (it becomes `already: true`). A locked Mac is a 409 refusal — an answer
+	/// is deliberately never parked.
+	public func answer(
+		sessionID: String, workspaceID: String, toolUseId: String?, kind: String,
+		options: [String]? = nil, approve: Bool? = nil, scraped: Bool? = nil
+	) async throws -> AnswerResult {
+		struct Body: Encodable {
+			let workspaceId: String
+			let toolUseId: String?
+			let kind: String
+			let options: [String]?
+			let approve: Bool?
+			let scraped: Bool?
+		}
+		let body = Body(
+			workspaceId: workspaceID, toolUseId: toolUseId, kind: kind, options: options, approve: approve,
+			scraped: scraped)
+		return try decode(
+			await perform(request(path: "/api/sessions/\(escape(sessionID))/answer", method: "POST", body: body, tier: .action)),
+			bodyCarriesErrors: true)
+	}
+
+	/// Scrape the live question/plan card off Conductor's pane — the read for
+	/// codex sessions, whose cards never reach the DB. `silentOnly` never
+	/// steals focus on the Mac: it answers `notVisible` when the chat isn't
+	/// the pane on screen, so the UI can ask before focusing Conductor.
+	public func card(sessionID: String, workspaceID: String, silentOnly: Bool) async throws -> ScrapedCard {
+		let path =
+			"/api/sessions/\(escape(sessionID))/card?workspaceId=\(escape(workspaceID))"
+			+ (silentOnly ? "&silent=1" : "")
+		// revalidate: false — a card re-fetch is deliberate; a 304 would hand
+		// the decoder an empty body.
+		return try decode(
+			await perform(request(path: path, tier: .action, revalidate: false)), bodyCarriesErrors: true)
+	}
+
 	/// Dismiss an undelivered first prompt (relay-owned; we may only display or drop it).
 	public func dismissFirstPrompt(workspaceID: String) async throws {
 		_ = try okBody(

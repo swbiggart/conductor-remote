@@ -112,6 +112,11 @@ struct AgentBar: View {
 		case idle, on, staged
 	}
 
+	// The PWA's corrected pill grammar, ported: **fill = the value the next
+	// prompt runs with, dashed outline = staged**. Solid accent is reserved
+	// for Conductor's own recorded state, so a staged-to-on pill (tinted +
+	// dashed) can never read as already-on — the old accent-filled staged
+	// style had exactly that flaw.
 	private func capsule(_ label: String, systemImage: String? = nil, state: CapsuleState) -> some View {
 		HStack(spacing: 4) {
 			if let systemImage {
@@ -123,13 +128,19 @@ struct AgentBar: View {
 		.padding(.vertical, 5)
 		.background(background(state), in: Capsule())
 		.foregroundStyle(foreground(state))
+		.overlay {
+			if state == .staged {
+				Capsule().strokeBorder(
+					Color.accent, style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+			}
+		}
 	}
 
 	private func background(_ state: CapsuleState) -> Color {
 		switch state {
 		case .idle: .surface
 		case .on: .surfaceRaised
-		case .staged: .accent
+		case .staged: .accentSoft
 		}
 	}
 
@@ -137,7 +148,7 @@ struct AgentBar: View {
 		switch state {
 		case .idle: Color(.secondaryLabel)
 		case .on: Color(.label)
-		case .staged: .black
+		case .staged: .accent
 		}
 	}
 

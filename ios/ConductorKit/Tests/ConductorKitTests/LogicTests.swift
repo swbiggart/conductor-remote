@@ -212,11 +212,20 @@ private func entry(
 		#expect(creds.token == "abc123")
 	}
 
-	@Test func rejectsBareTokenAndWhitespace() {
+	@Test func rejectsBareToken() {
 		// A bare token has no host to talk to — the UI asks for the full URL.
 		#expect(PairingParser.parse("deadbeefdeadbeef") == nil)
-		#expect(PairingParser.parse("https://x.ts.net/#token=a b") == nil)
 		#expect(PairingParser.parse("") == nil)
+	}
+
+	@Test func toleratesRealWorldPasteMangling() throws {
+		// iOS autocapitalizes the scheme; chat line-wraps insert whitespace
+		// mid-URL. Both hit live on first device pairing — never reject them.
+		let capitalized = try #require(PairingParser.parse("Https://mac.tail1234.ts.net/#token=abc123"))
+		#expect(capitalized.baseURL.absoluteString == "Https://mac.tail1234.ts.net")
+		#expect(capitalized.token == "abc123")
+		let wrapped = try #require(PairingParser.parse("https://mac.tail1234.ts.net/#tok en=abc1 23\n"))
+		#expect(wrapped.token == "abc123")
 	}
 }
 

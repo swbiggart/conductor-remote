@@ -178,6 +178,15 @@ public struct PendingPrompt: Codable, Sendable, Equatable {
 	public var failed: Bool { status == "failed" }
 }
 
+extension Workspace {
+	/// The active session is stopped on a question, plan approval, or any
+	/// other input Conductor is waiting for — surfaced on the board so a
+	/// blocked agent is visible without opening the chat.
+	public var awaitingInput: Bool { awaitingQuestion || awaitingPlan }
+	public var awaitingQuestion: Bool { sessionStatus == "needs_user_input" }
+	public var awaitingPlan: Bool { sessionStatus == "needs_plan_response" }
+}
+
 public struct ActuatorInfo: Codable, Sendable, Equatable {
 	public let name: String
 	public let caveat: String
@@ -240,6 +249,34 @@ public struct Session: Codable, Sendable, Identifiable, Equatable {
 	}
 
 	public var working: Bool { status == "working" }
+
+	/// The agent is stopped on a question or plan approval — transient
+	/// statuses that exist only while the wait does, so they're the cheap
+	/// "this tab needs you" signal for sessions whose transcript isn't the
+	/// one being polled.
+	public var awaitingInput: Bool { awaitingQuestion || awaitingPlan }
+	public var awaitingQuestion: Bool { status == "needs_user_input" }
+	public var awaitingPlan: Bool { status == "needs_plan_response" }
+}
+
+/// The live question/plan card as scraped off Conductor's pane via AX — the
+/// only read that exists for codex sessions, whose cards never reach the DB.
+public struct ScrapedCard: Codable, Sendable, Equatable {
+	public let ok: Bool
+	/// "question" | "plan" | "none" (none = no card on the pane right now).
+	public let kind: String?
+	/// One entry per question, each that question's options as full AX names
+	/// ("1 <label> <description>"). Answers must send one option per question,
+	/// verbatim, in order — a codex submit finalizes the whole card at once,
+	/// so partial answers are refused (live incident 2026-08-18: a partial
+	/// submit defaulted the unanswered questions).
+	public let questions: [[String]]?
+	/// Count of "Question N" nav buttons; >0 = multi-question card.
+	public let nav: Int?
+	/// silent=1 and the chat isn't the pane on screen — fetching without
+	/// silent will focus Conductor on the Mac.
+	public let notVisible: Bool?
+	public let error: String?
 }
 
 /// What the phone can change about a chat's agent (mirrors AgentOptions in src/writes.ts).
@@ -378,9 +415,70 @@ public struct AttachmentRef: Codable, Sendable, Equatable, Identifiable {
 	public var id: String { path }
 }
 
+public struct QuestionOption: Codable, Sendable, Equatable {
+	public let label: String
+	public let description: String?
+}
+
+public struct PendingQuestion: Codable, Sendable, Equatable {
+	public let question: String
+	public let header: String?
+	public let multiSelect: Bool?
+	public let options: [QuestionOption]
+
+	public var isMultiSelect: Bool { multiSelect == true }
+}
+
+/// A question or plan the agent is stopped on (mirrors PendingInput in
+/// src/reads.ts). Deliberately no status gate on the relay side — an
+/// unanswered interactive tool at the transcript tail *is* the flag.
+public struct PendingInput: Codable, Sendable, Equatable {
+	/// "question" | "plan"
+	public let kind: String
+	public let toolUseId: String
+	public let rowid: Int64
+	public let questions: [PendingQuestion]?
+	public let plan: String?
+	public let ts: String
+
+	public var isPlan: Bool { kind == "plan" }
+	/// Answerable from the phone: any number of questions, each single-choice.
+	public var answerable: Bool {
+		if isPlan { return true }
+		guard let questions, !questions.isEmpty else { return false }
+		return !questions.contains(where: \.isMultiSelect)
+	}
+}
+
+public struct AnswerResult: Codable, Sendable {
+	public let ok: Bool
+	/// Already answered (on the Mac, or by a retry after a lost response).
+	public let already: Bool?
+	public let error: String?
+}
+
 public struct MessagesResponse: Codable, Sendable {
 	public let entries: [TranscriptEntry]
 	public let cursor: Int64
+	/// Absent from relays older than this field — treat as "nothing pending".
+	public let pending: PendingInput?
+
+	private enum CodingKeys: String, CodingKey {
+		case entries, cursor, pending
+	}
+
+	public init(from decoder: Decoder) throws {
+		let c = try decoder.container(keyedBy: CodingKeys.self)
+		entries = try c.decode([TranscriptEntry].self, forKey: .entries)
+		cursor = try c.decode(Int64.self, forKey: .cursor)
+		pending = try c.decodeIfPresent(PendingInput.self, forKey: .pending)
+	}
+
+	public init(entries: [TranscriptEntry], cursor: Int64, pending: PendingInput? = nil) {
+		self.entries = entries
+		self.cursor = cursor
+		self.pending = pending
+	}
 }
 
 public struct DiffFile: Codable, Sendable, Identifiable, Equatable {

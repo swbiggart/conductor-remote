@@ -6,22 +6,40 @@ struct WorkspaceRow: View {
 	@Environment(AppModel.self) private var model
 	@State private var iconData: Data?
 	@State private var statusSheet = false
+	// The text-size setting reaches this list as *density*, not font scale:
+	// smaller settings tighten padding and shrink the avatar. Two lines per
+	// row, always — model/context moved out of the list (they're in the chat
+	// header where they're actionable).
+	@AppStorage("ui.textScale") private var textScale = TextScale.system
 
 	private var isWorking: Bool { workspace.sessionStatus == "working" }
 	private var unread: Int { model.unreadCount(workspace) }
 	private var settingUp: Bool { workspace.state == "setting_up" }
+	private var density: ListDensity { textScale.listDensity }
 
 	var body: some View {
-		HStack(spacing: 12) {
-			RepoAvatar(workspace: workspace, iconData: iconData, isWorking: isWorking)
+		HStack(spacing: density.rowSpacing) {
+			RepoAvatar(
+				workspace: workspace, iconData: iconData, isWorking: isWorking,
+				size: density.avatarSize)
 
-			VStack(alignment: .leading, spacing: 3) {
+			VStack(alignment: .leading, spacing: 2) {
 				HStack(spacing: 6) {
-					if unread > 0 {
+					// A blocked agent outranks the unread dot: clipboard = plan
+					// waiting for approval, red ? = question waiting for answers.
+					if workspace.awaitingPlan {
+						Image(systemName: "list.bullet.clipboard.fill")
+							.font(.caption)
+							.foregroundStyle(Color.accent)
+					} else if workspace.awaitingQuestion {
+						Image(systemName: "questionmark.circle.fill")
+							.font(.caption)
+							.foregroundStyle(Color.diffDelete)
+					} else if unread > 0 {
 						Circle().fill(Color.accent).frame(width: 6, height: 6)
 					}
 					Text(Format.workspaceLabel(workspace))
-						.font(.headline.weight(unread > 0 ? .bold : .semibold))
+						.font(.subheadline.weight(unread > 0 ? .bold : .semibold))
 						.lineLimit(1)
 				}
 				HStack(spacing: 6) {
@@ -39,23 +57,13 @@ struct WorkspaceRow: View {
 							.foregroundStyle(.tertiary)
 					}
 					if let branch = workspace.branch {
-						Text(branch)
+						// Owner prefix dropped ("swbiggart/fix-x" → "fix-x") —
+						// it's the same username on every row, pure noise here.
+						Text(branch.contains("/") ? String(branch.split(separator: "/").dropFirst().joined(separator: "/")) : branch)
 							.font(.footnote.monospaced())
 							.foregroundStyle(.secondary)
 							.lineLimit(1)
 							.truncationMode(.middle)
-					}
-				}
-				HStack(spacing: 8) {
-					if let short = Format.shortModel(workspace.model) {
-						Text(short)
-							.font(.caption.monospaced())
-							.foregroundStyle(.tertiary)
-					}
-					if let context = workspace.contextUsedPercent {
-						Text("\(Int(context))% ctx")
-							.font(.caption.monospacedDigit())
-							.foregroundStyle(contextColor(context))
 					}
 				}
 			}
@@ -85,7 +93,7 @@ struct WorkspaceRow: View {
 				}
 			}
 		}
-		.padding(.vertical, 6)
+		.padding(.vertical, density.rowVerticalPadding)
 		.listRowBackground(Color.appBackground)
 		.task(id: workspace.repoName) {
 			await loadIcon()
@@ -121,12 +129,6 @@ struct WorkspaceRow: View {
 			StatusPickerSheet(workspace: workspace)
 				.presentationDetents([.height(400)])
 		}
-	}
-
-	private func contextColor(_ percent: Double) -> Color {
-		if percent > 90 { return .diffDelete }
-		if percent > 70 { return .working }
-		return Color(.tertiaryLabel)
 	}
 
 	private func loadIcon() async {

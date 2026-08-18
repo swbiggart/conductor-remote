@@ -114,3 +114,46 @@ import Testing
 		#expect(Format.statusRank("done") < Format.statusRank("someday"))
 	}
 }
+
+@Suite struct PendingInputTests {
+	@Test func decodesPendingOnMessages() throws {
+		let json = """
+			{"entries":[],"cursor":7,"pending":{"kind":"question","toolUseId":"tu1","rowid":9,
+			 "questions":[{"question":"Which color?","options":[{"label":"Green"},{"label":"Blue","description":"calmer"}]}],
+			 "ts":"2026-08-16 01:00:00"}}
+			"""
+		let response = try JSONDecoder().decode(MessagesResponse.self, from: Data(json.utf8))
+		let pending = try #require(response.pending)
+		#expect(pending.answerable)
+		#expect(pending.questions?.first?.options.count == 2)
+		// Older relay without the field: absent → nil, not a decode failure.
+		let old = try JSONDecoder().decode(MessagesResponse.self, from: Data(#"{"entries":[],"cursor":0}"#.utf8))
+		#expect(old.pending == nil)
+	}
+
+	@Test func multiSelectIsNotAnswerable() throws {
+		let json = """
+			{"kind":"question","toolUseId":"t","rowid":1,"ts":"2026-08-16 01:00:00",
+			 "questions":[{"question":"Pick many","multiSelect":true,"options":[{"label":"A"}]}]}
+			"""
+		let pending = try JSONDecoder().decode(PendingInput.self, from: Data(json.utf8))
+		#expect(!pending.answerable)
+		let plan = try JSONDecoder().decode(
+			PendingInput.self,
+			from: Data(#"{"kind":"plan","toolUseId":"t","rowid":1,"ts":"2026-08-16 01:00:00","plan":"do x"}"#.utf8))
+		#expect(plan.answerable && plan.isPlan)
+	}
+}
+
+@Suite @MainActor struct TranscriptPendingTests {
+	@Test func pendingUpdatesEvenOnEmptyBatch() {
+		let model = TranscriptModel(sessionID: "s1")
+		let pending = PendingInput(
+			kind: "plan", toolUseId: "tu", rowid: 1, questions: nil, plan: "p", ts: "2026-08-16 01:00:00")
+		model.apply(MessagesResponse(entries: [], cursor: 0, pending: pending))
+		#expect(model.pending?.toolUseId == "tu")
+		// Answered on the Mac: pending drops on a poll with no new rows.
+		model.apply(MessagesResponse(entries: [], cursor: 0, pending: nil))
+		#expect(model.pending == nil)
+	}
+}

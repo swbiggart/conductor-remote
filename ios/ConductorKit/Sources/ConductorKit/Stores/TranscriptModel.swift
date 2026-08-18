@@ -35,12 +35,20 @@ public final class TranscriptModel {
 	/// persisted choice in.
 	private var liveSteps = false
 
+	/// The question/plan the agent is stopped on, riding every poll of this
+	/// chat (additive relay field). Nil the moment it's answered anywhere.
+	public private(set) var pending: PendingInput?
+
 	/// Returns the trimmed texts of newly-arrived user rows so the send
 	/// pipeline can retire matching optimistic bubbles.
 	@discardableResult
 	public func apply(_ response: MessagesResponse, trailingTurnActive: Bool? = nil) -> [String] {
 		loaded = true
 		if let trailingTurnActive { self.trailingTurnActive = trailingTurnActive }
+		// Before the empty-entries guard: `pending` changes on polls that carry
+		// no new rows (the card is answered on the Mac → pending goes nil with
+		// an empty batch, and the tool_result row may arrive later or never).
+		pending = response.pending
 		guard !response.entries.isEmpty else { return [] }
 		entries.append(contentsOf: response.entries)
 		cursor = max(cursor, response.cursor)

@@ -67,20 +67,22 @@ public struct KeychainTokenStore: TokenStore {
 /// pasted next to a host. Mirrors parseTokenInput in web/src/lib/api.ts.
 public enum PairingParser {
 	public static func parse(_ input: String) -> RelayCredentials? {
-		let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-		guard !trimmed.isEmpty, !trimmed.contains(where: \.isWhitespace) else { return nil }
-		guard let range = trimmed.range(of: "token=") else { return nil }
-		let token = String(trimmed[range.upperBound...])
+		// Strip ALL whitespace, not just the ends — a chat line-wrap inserts a
+		// space mid-URL — and tolerate iOS autocapitalizing the scheme
+		// ("Https://…"). Both were hit live on first device pairing.
+		let compact = String(input.filter { !$0.isWhitespace })
+		guard !compact.isEmpty else { return nil }
+		guard let range = compact.range(of: "token=") else { return nil }
+		let token = String(compact[range.upperBound...])
 			.split(separator: "&").first.map(String.init) ?? ""
 		guard !token.isEmpty else { return nil }
 		// Origin = everything before the #fragment or ?query carrying the token.
-		var origin = String(trimmed[..<range.lowerBound])
+		var origin = String(compact[..<range.lowerBound])
 		while let last = origin.last, "#?&/".contains(last) {
 			origin.removeLast()
 		}
-		guard let url = URL(string: origin), url.scheme?.hasPrefix("http") == true, url.host != nil else {
-			return nil
-		}
+		guard let url = URL(string: origin), url.scheme?.lowercased().hasPrefix("http") == true, url.host != nil
+		else { return nil }
 		return RelayCredentials(baseURL: url, token: token)
 	}
 }

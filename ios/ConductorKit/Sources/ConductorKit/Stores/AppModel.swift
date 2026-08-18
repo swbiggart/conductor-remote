@@ -298,7 +298,14 @@ public final class AppModel {
 				markSynced()
 			case .sessions(let workspaceID):
 				if let response = try await client.sessions(workspaceID: workspaceID) {
-					sessionsByWorkspace[workspaceID] = response.sessions
+					// Equality-guarded: @Observable fires on every set, and an
+					// unchanged 2 s poll re-laying-out the session screen is
+					// pure churn — the device watchdog killed the app twice
+					// inside exactly that layout machinery (0x8BADF00D,
+					// 2026-08-17/18).
+					if sessionsByWorkspace[workspaceID] != response.sessions {
+						sessionsByWorkspace[workspaceID] = response.sessions
+					}
 					autoFocusSession(workspaceID: workspaceID)
 					// A turn ending (or starting) between messages ticks must
 					// collapse (or unfold) the live steps without new rows.
@@ -321,7 +328,7 @@ public final class AppModel {
 				}
 				markSynced()
 			case .diff(let workspaceID):
-				if let response = try await client.diff(workspaceID: workspaceID) {
+				if let response = try await client.diff(workspaceID: workspaceID), diffs[workspaceID] != response {
 					diffs[workspaceID] = response
 				}
 			case .logs(let file):
@@ -347,12 +354,18 @@ public final class AppModel {
 
 	private func applyState(_ response: StateResponse) {
 		detectTurnEnds(response.workspaces)
-		workspaces = response.workspaces
-		actuator = response.actuator
-		relayVersion = response.version
-		update = response.update
-		stateLoaded = true
-		keyValueStore.encode(response.workspaces, forKey: Self.snapshotKey)
+		// Every set below is equality-guarded: @Observable fires on any
+		// assignment, and ETag 304s only dedupe byte-identical bodies — a
+		// semantically-equal poll must not re-layout every screen (see the
+		// sessions tick for the watchdog incident this guards against).
+		if workspaces != response.workspaces {
+			workspaces = response.workspaces
+			keyValueStore.encode(response.workspaces, forKey: Self.snapshotKey)
+		}
+		if actuator != response.actuator { actuator = response.actuator }
+		if relayVersion != response.version { relayVersion = response.version }
+		if update != response.update { update = response.update }
+		if !stateLoaded { stateLoaded = true }
 	}
 
 	/// working → idle must survive one more tick before it counts — a queued

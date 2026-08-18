@@ -23,13 +23,12 @@ struct ConductorRemoteApp: App {
 
 struct RootView: View {
 	@Environment(AppModel.self) private var model
-	@AppStorage("ui.textScale") private var textScale = TextScale.system
 
 	var body: some View {
 		content
-			// Settings ▸ Appearance ▸ Text size: one Dynamic Type override for
-			// the whole app; `system` leaves the device's own setting in charge.
-			.dynamicTypeSize(textScale.dynamicTypeSize.map { $0...$0 } ?? DynamicTypeSize.xSmall...DynamicTypeSize.accessibility5)
+			// Text size is applied per surface, not here: the transcript pins
+			// Dynamic Type (SessionScreen), the workspace list keeps system
+			// text and responds with density (WorkspaceRow.ListDensity).
 			.task {
 				// Dev hook: `SIMCTL_CHILD_CONDUCTOR_PAIR="http://…#token=…" simctl launch …`
 				// pairs a fresh simulator without driving the text field by hand.

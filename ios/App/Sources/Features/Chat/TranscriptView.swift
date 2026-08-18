@@ -50,6 +50,19 @@ struct TranscriptView: View {
 						WorkingRow(since: model.workingSince(session: session))
 							.id("working")
 					}
+					// The question/plan card is a *sibling* of the entry list —
+					// a step-group fold can never bury it (same rule as the PWA).
+					if let pending = transcript.pending {
+						InputRequestCard(workspace: workspace, session: session, pending: pending)
+							.id("pending-\(pending.toolUseId)")
+					} else if session.awaitingInput {
+						// Conductor says this chat is waiting, but the DB read
+						// has no card — a codex session (its cards never touch
+						// the DB) or a permission prompt. Scrape it off the
+						// pane instead.
+						ScrapedInputCard(workspace: workspace, session: session)
+							.id("scraped-\(session.id)")
+					}
 					Color.clear.frame(height: 4).id("bottom")
 				}
 				.padding(.horizontal, 16)
@@ -58,6 +71,19 @@ struct TranscriptView: View {
 			.defaultScrollAnchor(.bottom)
 			.scrollDismissesKeyboard(.interactively)
 			.background(Color.appBackground)
+			.overlay {
+				// A freshly-opened tab refetches its transcript from row 0 —
+				// until the first batch lands, say so instead of showing an
+				// empty conversation.
+				if !transcript.loaded {
+					VStack(spacing: 10) {
+						ProgressView()
+						Text("Loading transcript…")
+							.font(.footnote)
+							.foregroundStyle(.secondary)
+					}
+				}
+			}
 			.overlay(alignment: .bottomTrailing) {
 				MessageNavigator(
 					entries: transcript.userEntries, index: $navIndex,

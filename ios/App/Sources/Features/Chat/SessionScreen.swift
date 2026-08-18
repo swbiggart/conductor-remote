@@ -11,6 +11,7 @@ struct SessionScreen: View {
 	@State private var showDiff = false
 	@State private var showStatus = false
 	@State private var creatingChat = false
+	@AppStorage("ui.textScale") private var textScale = TextScale.system
 
 	private var workspace: Workspace? { model.workspace(workspaceID) }
 	private var sessions: [Session] { model.sessions(workspaceID: workspaceID) }
@@ -60,6 +61,10 @@ struct SessionScreen: View {
 				Spacer()
 			}
 		}
+		// Settings ▸ Text size pins the conversation surface only: system by
+		// default, one larger step, two smaller (the list densifies instead).
+		.dynamicTypeSize(
+			textScale.dynamicTypeSize.map { $0...$0 } ?? DynamicTypeSize.xSmall...DynamicTypeSize.accessibility5)
 		.background(Color.appBackground)
 		.navigationTitle(workspace.map(Format.workspaceLabel) ?? "")
 		.navigationBarTitleDisplayMode(.inline)
@@ -183,7 +188,26 @@ struct SessionScreen: View {
 							pickedSessionID = session.id
 						} label: {
 							HStack(spacing: 5) {
-								if model.isWorking(session: session) {
+								// Waiting on an answer outranks every other badge —
+								// it's the one state where the agent is blocked on *you*.
+								// Two sources, deliberately: the transient statuses
+								// (cheap, covers background tabs) OR the live pending
+								// read for the polled tab — the pending read has no
+								// status gate, so a wait the status misses still shows.
+								// Plan approvals get the clipboard; the red ? means a
+								// question.
+								let pending =
+									session.id == activeSession?.id
+									? model.transcript(sessionID: session.id).pending : nil
+								if session.awaitingPlan || pending?.isPlan == true {
+									Image(systemName: "list.bullet.clipboard.fill")
+										.font(.caption)
+										.foregroundStyle(Color.accent)
+								} else if session.awaitingQuestion || pending != nil {
+									Image(systemName: "questionmark.circle.fill")
+										.font(.caption)
+										.foregroundStyle(Color.diffDelete)
+								} else if model.isWorking(session: session) {
 									Circle().fill(Color.working).frame(width: 6, height: 6)
 								} else if model.isUnread(session: session) {
 									Circle().fill(Color.accent).frame(width: 6, height: 6)
@@ -217,8 +241,15 @@ struct SessionScreen: View {
 			.sensoryFeedback(.selection, trigger: pickedSessionID)
 			.onChange(of: activeSession?.id, initial: true) {
 				guard let id = activeSession?.id else { return }
-				withAnimation(.easeOut(duration: 0.2)) {
-					proxy.scrollTo(id, anchor: .center)
+				// Deferred a turn: scrollTo *during* the initial layout pass
+				// (initial: true fires mid-layout) can re-enter layout and
+				// freeze the whole UI — a timing-dependent hang seen live on
+				// device ("Review pasted text", 2026-08-18) that the simulator
+				// never reproduced.
+				Task { @MainActor in
+					withAnimation(.easeOut(duration: 0.2)) {
+						proxy.scrollTo(id, anchor: .center)
+					}
 				}
 			}
 		}
