@@ -46,6 +46,7 @@
 		"preview": "yarn build && yarn start",
 		"gen:icons": "node scripts/gen-icons.ts",
 		"deploy": "yarn build && node bin/cli.js service install",
+		"ios:deploy": "node scripts/ios-deploy.ts",
 		"service": "node bin/cli.js service",
 		"typecheck": "tsc -p tsconfig.json",
 		"lint": "biome check .",

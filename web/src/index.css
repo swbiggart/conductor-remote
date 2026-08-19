@@ -120,12 +120,21 @@
 	.ctl {
 		@apply rounded-full px-2 py-1 text-[13px] font-medium text-muted transition;
 	}
+	/* Toggle state grammar: the FILL is the value the next prompt runs with, a
+	   DASHED OUTLINE means "staged — applies when you send". Two orthogonal
+	   signals, so staged-to-on and staged-to-off can't read the same. The old
+	   scheme (on = subtle grey, staged = the brightest accent) made an
+	   already-plan chat's pill look off; tapping it staged OFF while lighting up. */
 	.ctl-on {
-		@apply bg-surface-2 text-text;
+		@apply bg-accent font-semibold text-bg;
 	}
-	/* Chosen on the phone, not yet pushed into Conductor — it rides along with the
-	   next message. Deliberately the accent, so "staged" can't read as "on". */
+	/* Staged, not yet pushed into Conductor — rides along with the next message.
+	   `outline`, not border, so nothing shifts. */
 	.ctl-staged {
+		@apply outline-dashed outline-1 -outline-offset-1 outline-accent;
+	}
+	/* Staged to ON: tinted rather than solid — it isn't on yet. */
+	.ctl-staged-on {
 		@apply bg-accent-soft text-accent;
 	}
 	.dot {

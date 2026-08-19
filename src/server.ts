@@ -20,13 +20,17 @@ import {
 	tailLogFile
 } from './logbuf.ts'
 import { mergePr } from './merge.ts'
+import { catalogEntry, invalidateModelCatalog, type ModelFamily, modelCatalog } from './modelcatalog.ts'
 import { notifyAll, notifyDevice, pushConfig, startNotifier, subscribeDevice, unsubscribeDevice } from './notify.ts'
 import { type ParkedAgentPatch, type ParkedPrompt, ParkedPromptQueue } from './parked.ts'
 import { attachPrStatus } from './pr.ts'
 import { Reads, type SessionRow, type Workspace } from './reads.ts'
+import { sidecarSendUserMessage } from './sidecar.ts'
 import { driftWarningLines, tailscaleBin } from './tailscale.ts'
 import {
 	type AgentOptions,
+	answerSession,
+	axDump,
 	type ChatTab,
 	createWorkspace,
 	describeActuator,
@@ -35,13 +39,16 @@ import {
 	lockBlocked,
 	newChat,
 	pickActuator,
+	readInputCard,
 	retryWontHelp,
 	type SendResult,
+	type SendTarget,
 	screenLocked,
 	setAgentOptions,
 	setRestartGuard,
 	setWorkspaceStatus,
-	WORKSPACE_STATUS_LABELS
+	WORKSPACE_STATUS_LABELS,
+	waitForUserIdle
 } from './writes.ts'
 
 // Before anything that logs: from here on every console line is also kept in memory for
@@ -162,8 +169,16 @@ async function confirmAgentOptions(ws: Workspace, sessionId: string, opts: Agent
 	for (let attempt = 0; attempt < 10; attempt++) {
 		const s = reads.listSessions(ws.id).find(row => row.id === sessionId)
 		const effortOk = !opts.effort || s?.claude_effort_level === opts.effort
-		const planOk = opts.plan === undefined || s?.permission_mode === (opts.plan ? 'plan' : 'default')
-		if (effortOk && planOk) return true
+		// Plan-off confirms on anything that isn't 'plan' — only 'default' lives in the
+		// DB today, but hard-coding the one other value Conductor happens to write would
+		// turn a third spelling into a permanent 502.
+		const planOk =
+			opts.plan === undefined || (opts.plan ? s?.permission_mode === 'plan' : s?.permission_mode !== 'plan')
+		// A catalog-resolved model change is confirmed by *id*, the exact value the
+		// menu press was supposed to produce — stricter than the label echo the
+		// AppleScript checks, and immune to badge wording.
+		const modelOk = !opts.modelId || s?.model === opts.modelId
+		if (effortOk && planOk && modelOk) return true
 		await sleep(300)
 	}
 	return false
@@ -215,7 +230,11 @@ async function deliverPrompt(
 		// write, and only the run knows what was left of the budget when it started. Minus
 		// the confirm, so a caller on a tight budget spends it on the run rather than on
 		// watching — a 25s-era phone gets one full-length attempt, not two too short to finish.
-		last = await actuator.send({ workspace: ws, sessionId, tab: located.tab }, text, deadline - MIN_CONFIRM_MS)
+		last = await actuator.send(
+			{ workspace: ws, sessionId, tab: located.tab, agentType: located.session?.agent_type },
+			text,
+			deadline - MIN_CONFIRM_MS
+		)
 		if (await confirmDelivery(sessionId, text, beforeRowid, deadline)) {
 			if (attempts > 1) console.info(`[relay] send to ${label} landed on attempt ${attempts}`)
 			return { ok: true, strategy: last.strategy, attempts }
@@ -261,6 +280,10 @@ const firstPrompts = new FirstPromptQueue(path.join(stateDir(), 'first-prompts.j
 	send: async (workspaceId, sessionId, text) => {
 		const ws = reads.getWorkspace(workspaceId)
 		if (!ws) return { ok: false, error: 'the workspace is gone' }
+		// Queue deliveries run on their own schedule with nobody waiting, so give the
+		// human at the Mac right of way — contention with their typing is the one
+		// cost a background send can always avoid.
+		await waitForUserIdle(5, 45_000)
 		const result = await deliverPrompt(ws, sessionId, text)
 		return { ok: result.ok, error: result.error, blocked: lockBlocked(result.error) }
 	},
@@ -281,14 +304,25 @@ async function applyAgentPatch(
 ): Promise<{ ok: boolean; error?: string }> {
 	const located = locateChat(ws, sessionId)
 	if ('error' in located) return { ok: false, error: located.error }
+	// `model` arrives as an id from clients that use the catalog and as a menu
+	// label from older ones; the id form resolves to the label the menu is pressed
+	// toward and to the exact DB value the confirm below checks.
+	const entry = patch.model ? catalogEntry(located.session?.agent_type ?? null, patch.model) : null
 	const opts: AgentOptions = {
 		effort: patch.effort,
 		plan: patch.plan,
-		model: patch.model,
+		model: entry?.label ?? patch.model,
+		modelId: entry?.id,
 		toggleFast: patch.fast === undefined ? false : patch.fast !== Boolean(located.session?.fast_mode)
 	}
 	const result = await setAgentOptions({ workspace: ws, sessionId, tab: located.tab }, opts)
-	if (!result.ok) return { ok: false, error: result.error }
+	if (!result.ok) {
+		// A catalog-derived label the live menu doesn't offer means the catalog and
+		// the menu disagree (an account-gated entry, or a label worded differently) —
+		// drop the catalog so the next model list is re-extracted or read live.
+		if (entry && /no model named|several models match/.test(result.error ?? '')) invalidateModelCatalog()
+		return { ok: false, error: result.error }
+	}
 	if (!(await confirmAgentOptions(ws, sessionId, opts))) {
 		return { ok: false, error: 'Conductor didn’t record the change — it may have been asleep. Try again.' }
 	}
@@ -307,6 +341,8 @@ const parkedPrompts = new ParkedPromptQueue(path.join(stateDir(), 'parked-prompt
 	deliver: async entry => {
 		const ws = reads.getWorkspace(entry.workspaceId)
 		if (!ws) return { ok: false, error: 'the workspace is gone' }
+		// The user just unlocked the Mac — don't fight their first clicks for the UI.
+		await waitForUserIdle(5, 45_000)
 		// Settings first, prompt only if they stuck — the same order and the same
 		// fail-closed rule as the phone's own send (running the prompt on the model
 		// the user moved away from is the mistake this exists to prevent). A re-run
@@ -319,6 +355,38 @@ const parkedPrompts = new ParkedPromptQueue(path.join(stateDir(), 'parked-prompt
 		const result = await deliverPrompt(ws, entry.sessionId, entry.text)
 		return { ok: result.ok, error: result.error, blocked: lockBlocked(result.error) }
 	},
+	// Opt-in (SIDECAR_WHEN_LOCKED=1, see CLAUDE.md): while the Mac is locked —
+	// where AppleScript is structurally dead and nobody is watching the desktop —
+	// try one sidecar delivery per entry over Conductor's own dispatch socket.
+	// Only text-only entries: staged settings need the UI, so they wait for the
+	// unlock as before. The transcript is the receipt here exactly as for a UI
+	// send: the sidecar's RPC returns void and reports failures out-of-band, so
+	// `confirmDelivery` against the DB is the only signal trusted. Gated on the
+	// supervised tunnel-recovery experiment (scripts/sidecar-probe.ts) because
+	// every socket connection displaces the app's own event tunnel.
+	deliverLocked:
+		process.env.SIDECAR_WHEN_LOCKED === '1'
+			? async entry => {
+					if (entry.agent) return { ok: false, error: 'staged settings need the unlocked UI' }
+					const ws = reads.getWorkspace(entry.workspaceId)
+					if (!ws?.worktree) return { ok: false, error: 'workspace worktree could not be resolved' }
+					const located = locateChat(ws, entry.sessionId)
+					if ('error' in located) return { ok: false, error: located.error }
+					const before = reads.getMessages(entry.sessionId).cursor
+					try {
+						await sidecarSendUserMessage({
+							sessionId: entry.sessionId,
+							text: entry.text,
+							cwd: ws.worktree,
+							agentType: located.session?.agent_type ?? 'claude'
+						})
+					} catch (err) {
+						return { ok: false, error: err instanceof Error ? err.message : String(err) }
+					}
+					const landed = await confirmDelivery(entry.sessionId, entry.text, before, Date.now() + 15_000)
+					return landed ? { ok: true } : { ok: false, error: 'the sidecar accepted the send but no user row appeared' }
+				}
+			: undefined,
 	notify: (entry: ParkedPrompt, error?: string) => {
 		const ws = reads.getWorkspace(entry.workspaceId)
 		const title = ws?.workspace_name ?? ws?.pr_title ?? ws?.branch ?? 'Conductor'
@@ -334,6 +402,17 @@ const parkedPrompts = new ParkedPromptQueue(path.join(stateDir(), 'parked-prompt
 		})
 	}
 })
+
+/** What the transcript file endpoint will serve — images only, no scriptable types (svg). */
+const IMAGE_MIME: Record<string, string> = {
+	'.png': 'image/png',
+	'.jpg': 'image/jpeg',
+	'.jpeg': 'image/jpeg',
+	'.gif': 'image/gif',
+	'.webp': 'image/webp',
+	'.heic': 'image/heic'
+}
+const MAX_SERVED_FILE_BYTES = 20 * 1024 * 1024
 
 const MIME: Record<string, string> = {
 	'.html': 'text/html; charset=utf-8',
@@ -661,6 +740,10 @@ const server = http.createServer(async (req, res) => {
 			}
 			const ws = reads.getWorkspace(workspaceId)
 			if (!ws) return json(req, res, 404, { error: 'workspace not found' })
+			// The one observed failure mode of this write is contention: the row menu
+			// dies the moment the human clicks elsewhere. A status change isn't urgent
+			// the way a send is, so wait briefly for idle hands (fail-open, capped).
+			await waitForUserIdle(3, 10_000)
 			const result = await setWorkspaceStatus(ws, status)
 			if (!result.ok) return json(req, res, 502, result)
 			// The menu press lands in the DB a beat later. Confirm rather than assume —
@@ -685,11 +768,76 @@ const server = http.createServer(async (req, res) => {
 		// GET /api/sessions/:id/messages?after=<rowid>
 		m = pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/)
 		if (req.method === 'GET' && m) {
+			const sessionId = decodeURIComponent(m[1])
 			const after = Number(url.searchParams.get('after') ?? 0)
-			return json(req, res, 200, reads.getMessages(decodeURIComponent(m[1]), Number.isFinite(after) ? after : 0))
+			// `pending` rides the open chat's 1s poll — the cheapest place for it, and
+			// the only place that can *answer*. Additive: a stale PWA ignores it.
+			return json(req, res, 200, {
+				...reads.getMessages(sessionId, Number.isFinite(after) ? after : 0),
+				pending: reads.pendingInput(sessionId)
+			})
 		}
 
-		// GET /api/sessions/:id/models?workspaceId= — labels from Conductor's live picker
+		// GET /api/sessions/:id/file?path=… — serve an image the transcript references
+		// (a Read-step screenshot, a user attachment). **The transcript is the ACL**:
+		// the exact path string must appear in this session's entries (a tool row's
+		// detail or an attachment ref), which both scopes what the token can reach and
+		// kills traversal — no path the agent never touched is servable. Images only,
+		// size-capped; relative paths resolve against the session's worktree, the same
+		// base the transcript's relative paths already mean.
+		m = pathname.match(/^\/api\/sessions\/([^/]+)\/file$/)
+		if (req.method === 'GET' && m) {
+			const sessionId = decodeURIComponent(m[1])
+			const filePath = url.searchParams.get('path') ?? ''
+			const mime = IMAGE_MIME[path.extname(filePath).toLowerCase()]
+			if (!mime) return json(req, res, 400, { error: 'only image files are served' })
+			const { entries } = reads.getMessages(sessionId)
+			const referenced = entries.some(e => e.detail === filePath || e.attachments?.some(a => a.path === filePath))
+			if (!referenced) return json(req, res, 404, { error: 'file not referenced in this chat' })
+			const worktree = reads.worktreeFor(sessionId)
+			const abs = path.isAbsolute(filePath) ? filePath : worktree ? path.join(worktree, filePath) : null
+			if (!abs) return json(req, res, 404, { error: 'no worktree to resolve the path against' })
+			try {
+				const stat = await fs.promises.stat(abs)
+				if (stat.size > MAX_SERVED_FILE_BYTES) return json(req, res, 413, { error: 'file too large' })
+				const body = await fs.promises.readFile(abs)
+				res.writeHead(200, { 'content-type': mime, 'cache-control': 'private, max-age=3600' })
+				return res.end(body)
+			} catch {
+				return json(req, res, 404, { error: 'file not found on disk' })
+			}
+		}
+
+		// GET /api/sessions/:id/models?workspaceId=[&refresh=1] — the models this chat's
+		// agent family offers. Served from the catalog extracted out of Conductor's own
+		// runtime binary (src/modelcatalog.ts): no Accessibility, no stolen focus, can't
+		// go stale (the binary is the installed version's truth, and an update
+		// invalidates the cache by changing it). `refresh=1` — the picker's manual
+		// refresh — is the one path that still opens the live menu, and it's also the
+		// fallback whenever the catalog can't answer (an `acp` chat, an unparseable
+		// binary). `models` stays a plain label list for older clients; `entries`
+		// carries the ids new clients stage (additive — a stale PWA ignores it).
+		// GET /api/sessions/:id/card?workspaceId=&silent=1 — scrape the live
+		// question/plan card via AX. This read exists because codex sessions'
+		// cards never touch conductor.db (verified live 2026-08-18): the pane is
+		// the only place they exist. On-demand only — never polled. `silent=1`
+		// never steals focus: it answers 409 {notVisible:true} when the chat
+		// isn't the pane on screen, so the phone asks before yanking the Mac.
+		m = pathname.match(/^\/api\/sessions\/([^/]+)\/card$/)
+		if (req.method === 'GET' && m) {
+			const sessionId = decodeURIComponent(m[1])
+			const ws = reads.getWorkspace(url.searchParams.get('workspaceId') ?? '')
+			if (!ws) return json(req, res, 404, { error: 'workspace for session not found' })
+			const located = locateChat(ws, sessionId)
+			if ('error' in located) return json(req, res, 409, { error: located.error })
+			const card = await readInputCard(
+				{ workspace: ws, sessionId, tab: located.tab },
+				url.searchParams.get('silent') === '1'
+			)
+			if (!card.ok) return json(req, res, card.notVisible ? 409 : 502, card)
+			return json(req, res, 200, card)
+		}
+
 		m = pathname.match(/^\/api\/sessions\/([^/]+)\/models$/)
 		if (req.method === 'GET' && m) {
 			const sessionId = decodeURIComponent(m[1])
@@ -697,8 +845,23 @@ const server = http.createServer(async (req, res) => {
 			if (!ws) return json(req, res, 404, { error: 'workspace for session not found' })
 			const located = locateChat(ws, sessionId)
 			if ('error' in located) return json(req, res, 409, { error: located.error })
+			const refresh = url.searchParams.get('refresh') === '1'
+			if (!refresh) {
+				const family = (located.session?.agent_type ?? 'claude') as ModelFamily
+				const catalog = modelCatalog()
+				const entries = catalog?.families[family]
+				if (entries?.length) {
+					return json(req, res, 200, {
+						ok: true,
+						models: entries.map(e => e.label),
+						entries,
+						source: 'catalog',
+						conductor_version: catalog?.conductorVersion ?? null
+					})
+				}
+			}
 			const result = await listAgentModels({ workspace: ws, sessionId, tab: located.tab })
-			return json(req, res, result.ok ? 200 : 502, result)
+			return json(req, res, result.ok ? 200 : 502, { ...result, source: 'live' })
 		}
 
 		// POST /api/sessions/:id/agent  { effort?, plan?, fast?, model? }
@@ -723,6 +886,166 @@ const server = http.createServer(async (req, res) => {
 			const applied = await applyAgentPatch(ws, sessionId, body)
 			if (!applied.ok) return json(req, res, 502, { ok: false, strategy: actuator.name, error: applied.error })
 			return json(req, res, 200, { ok: true, session: reads.listSessions(ws.id).find(s => s.id === sessionId) })
+		}
+
+		// GET /api/debug/ax — diagnostic dump of the visible pane's AX tree. Reads only;
+		// token-gated like /api/logs, and its output is user-screen text — same rule:
+		// don't log it, hand it back to whoever holds the token.
+		if (req.method === 'GET' && pathname === '/api/debug/ax') {
+			const wsId = url.searchParams.get('workspaceId')
+			const sessionId = url.searchParams.get('sessionId')
+			let target: SendTarget | undefined
+			if (wsId && sessionId) {
+				const ws = reads.getWorkspace(wsId)
+				if (!ws) return json(req, res, 404, { error: 'workspace not found' })
+				const located = locateChat(ws, sessionId)
+				if ('error' in located) return json(req, res, 409, { error: located.error })
+				target = { workspace: ws, sessionId, tab: located.tab }
+			}
+			const result = await axDump(target)
+			return json(req, res, result.ok ? 200 : 502, result)
+		}
+
+		// POST /api/sessions/:id/answer — press an option or Approve on the chat's
+		// pending question/plan card. Validated against the live pending read before
+		// anything is pressed, and confirmed against the transcript receipt after.
+		m = pathname.match(/^\/api\/sessions\/([^/]+)\/answer$/)
+		if (req.method === 'POST' && m) {
+			const sessionId = decodeURIComponent(m[1])
+			const body = JSON.parse((await readBody(req)) || '{}') as {
+				workspaceId?: string
+				toolUseId?: string
+				kind?: 'question' | 'plan'
+				options?: string[]
+				approve?: boolean
+				/** Codex path: validate against a fresh AX scrape, not the DB read. */
+				scraped?: boolean
+			}
+			if ((!body.toolUseId && !body.scraped) || (body.kind !== 'question' && body.kind !== 'plan')) {
+				return json(req, res, 400, { error: 'toolUseId (or scraped:true) and kind are required' })
+			}
+			const ws = body.workspaceId
+				? reads.getWorkspace(body.workspaceId)
+				: (reads.listWorkspaces().find(w => w.active_session_id === sessionId) ?? null)
+			if (!ws) return json(req, res, 404, { error: 'workspace for session not found' })
+			const located = locateChat(ws, sessionId)
+			if ('error' in located) return json(req, res, 409, { error: located.error })
+			if (body.scraped) {
+				// Codex sessions: the card has no DB row (nothing to validate a
+				// toolUseId against and no transcript receipt after), so both
+				// halves ride the scrape — the label must be on the card *now*,
+				// and success = the card visibly changed after the press.
+				const target = { workspace: ws, sessionId, tab: located.tab }
+				const before = await readInputCard(target, false)
+				if (!before.ok) return json(req, res, 502, before)
+				if (body.kind === 'plan') {
+					if (before.kind !== 'plan') {
+						return json(req, res, 409, {
+							ok: false,
+							error: 'no plan card on the pane anymore — it may have been answered on the Mac'
+						})
+					}
+					if (!body.approve) return json(req, res, 400, { error: 'plan answers support approve only' })
+				} else {
+					const labels = body.options ?? []
+					const questions = before.questions ?? []
+					if (before.kind !== 'question' || !questions.length) {
+						return json(req, res, 409, {
+							ok: false,
+							error: 'no question card on the pane anymore — it may have been answered on the Mac'
+						})
+					}
+					// ALL questions, or nothing: a codex submit finalizes the whole
+					// card, so a partial answer would silently default the rest —
+					// exactly the live incident this guard exists to prevent.
+					if (labels.length !== questions.length || labels.some((l, i) => !questions[i]?.includes(l))) {
+						return json(req, res, 400, {
+							error: `send one option per question (${questions.length}), each verbatim from the scraped card`
+						})
+					}
+				}
+				const pressed = await answerSession(target, { kind: body.kind, labels: body.options ?? [], scraped: true })
+				if (!pressed.ok && lockBlocked(pressed.error)) {
+					return json(req, res, 409, {
+						ok: false,
+						strategy: pressed.strategy,
+						error: 'The Mac is locked — unlock it to answer, or reply from the Mac.'
+					})
+				}
+				// The receipt is the card itself: gone, or advanced to the next
+				// question, means the press landed regardless of what it reported.
+				const after = await readInputCard(target, false)
+				const changed =
+					after.ok &&
+					(after.kind !== before.kind ||
+						JSON.stringify(after.questions ?? []) !== JSON.stringify(before.questions ?? []))
+				if (changed) return json(req, res, 200, { ok: true, card: after })
+				return json(req, res, 502, {
+					ok: false,
+					error: pressed.ok
+						? 'the press did not change the card — try again or answer on the Mac'
+						: (pressed.error ?? 'press failed')
+				})
+			}
+			// Non-scraped from here on: the DB read is the validator and the receipt.
+			if (!body.toolUseId) return json(req, res, 400, { error: 'toolUseId is required' })
+			// Fail closed against the live read: a card answered on the Mac between the
+			// phone's poll and this POST must become a refusal (or an idempotent ok),
+			// never a press against whatever the chat shows now.
+			const pending = reads.pendingInput(sessionId)
+			if (!pending || pending.toolUseId !== body.toolUseId || pending.kind !== body.kind) {
+				if (reads.answerRecorded(sessionId, body.toolUseId, 0)) {
+					return json(req, res, 200, { ok: true, already: true })
+				}
+				return json(req, res, 409, {
+					ok: false,
+					error: 'that question is no longer waiting — it may have been answered on the Mac'
+				})
+			}
+			let labels: string[] = []
+			if (body.kind === 'question') {
+				// One answer per question, in order — Conductor shows a multi-question card
+				// one question at a time, and the press sequence follows that.
+				const qs = pending.questions ?? []
+				if (!qs.length || qs.some(q => q.multiSelect)) {
+					return json(req, res, 400, {
+						error: 'only single-choice questions can be answered from the phone — answer this one in Conductor'
+					})
+				}
+				labels = body.options ?? []
+				if (labels.length !== qs.length || labels.some((l, i) => !qs[i].options.some(o => o.label === l))) {
+					return json(req, res, 400, {
+						error: 'answers must be one option per question, each from that question’s own options'
+					})
+				}
+			} else if (!body.approve) {
+				return json(req, res, 400, {
+					error: 'plan answers support approve only — to keep planning, reply from the composer'
+				})
+			}
+			const result = await answerSession({ workspace: ws, sessionId, tab: located.tab }, { kind: body.kind, labels })
+			if (!result.ok && lockBlocked(result.error)) {
+				// Deliberately not parked (unlike a prompt): a parked button-press firing
+				// hours later would land in a conversation that may have moved on.
+				return json(req, res, 409, {
+					ok: false,
+					strategy: result.strategy,
+					error: 'The Mac is locked — unlock it to answer, or reply from the Mac.'
+				})
+			}
+			// The receipt is the truth (see confirmDelivery): watch for the tool_result row
+			// regardless of what the press reported — a press that landed but reported an
+			// error is a success, and a retry after a lost report turns into already:true.
+			const stopAt = Date.now() + CONFIRM_WINDOW_MS
+			while (Date.now() < stopAt) {
+				if (reads.answerRecorded(sessionId, pending.toolUseId, pending.rowid)) return json(req, res, 200, { ok: true })
+				await sleep(300)
+			}
+			return json(req, res, 502, {
+				ok: false,
+				strategy: result.strategy,
+				error: result.ok ? 'the answer didn’t register — try again' : result.error
+			})
 		}
 
 		// POST /api/sessions/:id/prompt  { text, agent? } — agent is the phone's staged

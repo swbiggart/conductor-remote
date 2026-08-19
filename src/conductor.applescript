@@ -60,6 +60,11 @@
 	aborts *before* typing — landing in the wrong chat is worse than not sending.
 *)
 
+-- Sidebar sections this run expanded to reach a hidden row (setWorkspaceStatus).
+-- Recorded so restoreExpandedSections can collapse them again: a phone action
+-- must not rearrange the sidebar someone deliberately folded.
+property gExpandedSections : {}
+
 on splitLines(s)
 	set saved to AppleScript's text item delimiters
 	set AppleScript's text item delimiters to linefeed
@@ -750,6 +755,91 @@ on pasteComposer()
 	end tell
 end pasteComposer
 
+on pressSendButton()
+	-- Press the composer's own send control instead of typing Enter. Two things
+	-- Enter can't give: an AXPress works on a *background* app (a keystroke goes to
+	-- whatever is frontmost, which is why the silent path below needs this), and it
+	-- can't be swallowed by a focus that moved. Fail-closed: only a *unique* button
+	-- whose name says send is pressed — anything else returns false and the caller
+	-- keeps the Enter keystroke, so an unmapped Conductor build loses nothing.
+	try
+		set hits to {}
+		repeat with entry in my composerControls()
+			set c to contents of entry
+			if (my axRole(c)) is "AXButton" and (my tabLabel(c)) contains "send" then set end of hits to c
+		end repeat
+		if (count of hits) is not 1 then return false
+		tell application "System Events" to tell process "Conductor"
+			perform action "AXPress" of (item 1 of hits)
+		end tell
+		return true
+	on error
+		return false
+	end try
+end pressSendButton
+
+on silentSend(promptText)
+	-- The activation-free fast path: when Conductor already shows the target chat,
+	-- a send needs no `activate` at all — every step below is an AX read, set or
+	-- press, and those work on a background app. The person at the Mac keeps their
+	-- focus; the phone's send lands silently behind it. Any surprise — no window
+	-- (also the locked/full-screen case: AX sees neither), wrong pane, unmapped
+	-- send button — returns false and the activation ladder takes over, so this
+	-- can only ever *save* the disruption, never trade correctness for it.
+	-- fillComposer *sets* AXValue rather than appending, so a false return after a
+	-- successful fill leaves nothing the ladder's own fill wouldn't replace.
+	try
+		if not (my hasWindow()) then return false
+		if not (my atTargetWorkspace()) then return false
+		my selectChatTab()
+		if not (my fillComposer(promptText)) then return false
+		return my pressSendButton()
+	on error
+		return false
+	end try
+end silentSend
+
+on silentApplyAgentOptions()
+	-- silentSend's twin for the composer's agent controls. Effort, Plan and
+	-- Fast are plain AX presses that work from the background; a requested
+	-- model change opts out — it opens the real picker menu, and menus are
+	-- the one AX surface with known ghost behaviour (see closeMenus), never
+	-- probed from a background app. The ladder handles those.
+	if (system attribute "RELAY_SET_MODEL") is not "" then return false
+	try
+		if not (my hasWindow()) then return false
+		if not (my atTargetWorkspace()) then return false
+		my selectChatTab()
+		my applyAgentOptions()
+		return true
+	on error
+		return false
+	end try
+end silentApplyAgentOptions
+
+on silentAnswer(kindIsPlan)
+	-- silentSend's twin for the question/plan card: when Conductor already shows
+	-- the target chat, the card's buttons press fine from the background — no
+	-- activate, no stolen focus. Any surprise (no window — also the locked and
+	-- full-screen-Space case — wrong pane, missing card) returns false and the
+	-- activation ladder takes over, so this only ever saves disruption. The
+	-- press handlers' own label-mismatch errors are swallowed here and re-raised
+	-- with evidence by the ladder's run — same failure, better words.
+	try
+		if not (my hasWindow()) then return false
+		if not (my atTargetWorkspace()) then return false
+		my selectChatTab()
+		if kindIsPlan then
+			my pressApprovePlan()
+		else
+			my pressAnswerOption()
+		end if
+		return true
+	on error
+		return false
+	end try
+end silentAnswer
+
 on selectChatTab()
 	set wantIndex to (system attribute "RELAY_TAB_INDEX") as integer
 	if wantIndex is 0 then return
@@ -842,17 +932,34 @@ on setEffort(wanted)
 	error "couldn't set effort to " & wanted
 end setEffort
 
+on planValue(box)
+	-- Normalize the checkbox's AXValue to a boolean. The old branches compared the
+	-- raw text against "0" asymmetrically, so a checkbox reporting true/false made
+	-- "turn plan on" silently no-op and "turn plan off" press it *on*. An unknown
+	-- spelling errors in words instead of guessing a direction.
+	tell application "System Events" to tell process "Conductor"
+		set v to value of box
+	end tell
+	set t to (v as text)
+	if t is "1" or t is "true" then return true
+	if t is "0" or t is "false" then return false
+	error "the Plan toggle's state read as " & quote & t & quote & " - expected 0/1/true/false"
+end planValue
+
 on setPlan(wanted)
 	set box to my controlNamed("Plan")
 	if box is missing value then error "couldn't find the Plan toggle"
-	tell application "System Events" to tell process "Conductor"
-		set current to ((value of box) as text)
-		if (wanted is "1" and current is "0") or (wanted is "0" and current is not "0") then
+	set target to (wanted is "1")
+	if (my planValue(box)) is not target then
+		tell application "System Events" to tell process "Conductor"
 			perform action "AXPress" of box
-			delay 0.4
-			if ((value of box) as text) is current then error "the Plan toggle didn't change"
-		end if
-	end tell
+		end tell
+		delay 0.4
+		-- Re-find: the webview re-render on toggle can stale the old handle.
+		set box to my controlNamed("Plan")
+		if box is missing value then error "the Plan toggle vanished after pressing"
+		if (my planValue(box)) is not target then error "the Plan toggle didn't change"
+	end if
 end setPlan
 
 on pressFast()
@@ -874,6 +981,19 @@ on firstLine(s)
 	return item 1 of parts
 end firstLine
 
+on remainderIsBadge(label, wanted)
+	-- "Opus 5 NEW" is the wanted "Opus 5" plus a badge; "Opus 5 1M" is a
+	-- different model. The distinction is what lets a catalog-derived label
+	-- (which never carries badges) press the badged menu item and nothing else.
+	if not (label starts with wanted) then return false
+	if (length of label) is (length of wanted) then return false
+	set leftover to text ((length of wanted) + 1) thru -1 of label
+	repeat with badgeWord in (words of leftover)
+		if (badgeWord as text) is not in {"NEW", "BETA", "PREVIEW"} then return false
+	end repeat
+	return true
+end remainderIsBadge
+
 on setModel(wanted)
 	set popup to missing value
 	repeat with entry in my composerControls()
@@ -886,10 +1006,12 @@ on setModel(wanted)
 		perform action "AXPress" of popup
 	end tell
 	delay 1.0
-	-- Menu labels carry badges ("Opus 5 NEW"), so an exact match is preferred but a
-	-- prefix match is accepted — except when it is ambiguous ("Sonnet 4.6" would
-	-- otherwise also match "Sonnet 4.6 1M"), which must fail rather than guess.
+	-- Menu labels carry badges ("Opus 5 NEW"), so the match runs in tiers: exact,
+	-- then wanted-plus-badge-words only, then unique prefix — which must fail when
+	-- ambiguous ("Sonnet 4.6" would otherwise also match "Sonnet 4.6 1M") rather
+	-- than guess.
 	set chosen to missing value
+	set badged to {}
 	set loose to {}
 	set wa to my webArea()
 	tell application "System Events" to tell process "Conductor"
@@ -898,16 +1020,19 @@ on setModel(wanted)
 				set label to my firstLine(my tabLabel(mi))
 				if label is wanted then
 					set chosen to contents of mi
+				else if my remainderIsBadge(label, wanted) then
+					set end of badged to contents of mi
 				else if label starts with wanted then
 					set end of loose to contents of mi
 				end if
 			end repeat
 		end repeat
 	end tell
+	if chosen is missing value and (count of badged) is 1 then set chosen to item 1 of badged
 	if chosen is missing value and (count of loose) is 1 then set chosen to item 1 of loose
 	if chosen is missing value then
-		tell application "System Events" to key code 53
-		if (count of loose) > 1 then error "several models match " & wanted
+		log "setModel: closed the picker via " & my closeMenus(2)
+		if (count of loose) > 1 or (count of badged) > 1 then error "several models match " & wanted
 		error "no model named " & wanted
 	end if
 	tell application "System Events" to tell process "Conductor"
@@ -920,7 +1045,13 @@ on setModel(wanted)
 		if my tabLabel(c) contains "Change agent" then set popup to c
 	end repeat
 	if popup is missing value then error "the model picker vanished"
-	if (my tabLabel(popup)) does not contain ("(" & wanted & ")") then error "the model didn't switch to " & wanted
+	-- The popup may echo the badge ("(Opus 5 NEW)"), so accept the exact paren form
+	-- or the badge continuation; a catalog-resolved change is additionally confirmed
+	-- against the DB's model id by the caller (server.ts), which is the strict check.
+	set popupLabel to my tabLabel(popup)
+	if not (popupLabel contains ("(" & wanted & ")") or popupLabel contains ("(" & wanted & " ")) then
+		error "the model didn't switch to " & wanted
+	end if
 end setModel
 
 on listModels()
@@ -945,7 +1076,9 @@ on listModels()
 			end repeat
 		end repeat
 	end tell
-	tell application "System Events" to key code 53
+	-- The picker's only close. Escape alone left it standing whenever something
+	-- swallowed the keystroke, and the next run inherited an open menu.
+	log "listModels: closed the picker via " & my closeMenus(2)
 	set saved to AppleScript's text item delimiters
 	set AppleScript's text item delimiters to linefeed
 	set joined to labels as text
@@ -963,6 +1096,381 @@ on applyAgentOptions()
 	if wantPlan is not "" then my setPlan(wantPlan)
 	if wantFast is "1" then my pressFast()
 end applyAgentOptions
+
+on chatPressables()
+	-- Every pressable control under the web area, walked depth-first with LATER
+	-- siblings first: the question/plan card renders at the bottom of the message
+	-- list, so a reverse walk reaches it before the transcript's thousands of
+	-- older rows. Both caps are load-bearing (the setWorkspaceStatus lesson — an
+	-- unbounded sweep of this tree costs more than the whole write): a card the
+	-- caps miss surfaces as "couldn't find", never as a wrong press.
+	set wa to my webArea()
+	set found to {}
+	set stack to {wa}
+	set visited to 0
+	repeat while (count of stack) > 0 and visited < 350
+		set node to item -1 of stack
+		if (count of stack) is 1 then
+			set stack to {}
+		else
+			set stack to items 1 thru -2 of stack
+		end if
+		set visited to visited + 1
+		repeat with k in (my axKids(node))
+			set kid to contents of k
+			set r to my axRole(kid)
+			if r is "AXButton" or r is "AXRadioButton" or r is "AXCheckBox" then
+				set end of found to kid
+			else if r is not "AXStaticText" and r is not "AXImage" and r is not "AXLink" and r is not "AXTextArea" and r is not "AXMenu" then
+				set end of stack to kid
+			end if
+		end repeat
+	end repeat
+	return found
+end chatPressables
+
+on matchControls(cands, wanted)
+	-- Exact name first; only if nothing is exact, a containing match (web buttons
+	-- sometimes carry appended text). Ambiguity is the caller's to refuse.
+	set hits to {}
+	repeat with c in cands
+		if (my axName(c)) is wanted then set end of hits to contents of c
+	end repeat
+	if (count of hits) > 0 then return hits
+	repeat with c in cands
+		if (my axName(c)) contains wanted then set end of hits to contents of c
+	end repeat
+	return hits
+end matchControls
+
+on pressableEvidence(cands)
+	-- The names actually on screen — a failed match must say what it saw, both for
+	-- the person retrying and because this is the discovery dump for a card shape
+	-- nothing documents.
+	set names to {}
+	repeat with c in cands
+		set n to my axName(c)
+		if n is not "" then set end of names to n
+	end repeat
+	return my joinList(names, " | ")
+end pressableEvidence
+
+on questionSubmitButton()
+	-- The question card's submit is an UNNAMED icon button (discovered live), so it
+	-- can only be found by anchor: Conductor renders the options as radio buttons
+	-- followed by an "Other response" free-text area, and the submit is the sole
+	-- button between that text area and the next splitter. Anything other than
+	-- exactly one candidate errors rather than guesses.
+	set wa to my webArea()
+	set stack to {wa}
+	set visited to 0
+	repeat while (count of stack) > 0 and visited < 350
+		set node to item -1 of stack
+		if (count of stack) is 1 then
+			set stack to {}
+		else
+			set stack to items 1 thru -2 of stack
+		end if
+		set visited to visited + 1
+		set kidList to my axKids(node)
+		if (count of kidList) > 0 then
+			set roleList to {}
+			set nameList to {}
+			tell application "System Events" to tell process "Conductor"
+				try
+					set roleList to role of UI elements of node
+				end try
+				try
+					set nameList to name of UI elements of node
+				end try
+			end tell
+			set anchor to 0
+			repeat with i from 1 to (count of kidList)
+				set r to ""
+				try
+					set r to (item i of roleList) as text
+				end try
+				set n to ""
+				try
+					if (item i of nameList) is not missing value then set n to (item i of nameList) as text
+				end try
+				if r is "AXTextArea" and n is "Other response" then set anchor to i
+			end repeat
+			if anchor > 0 then
+				-- Multi-question cards put their nav buttons ("Previous question",
+				-- "Question 2", …) in the same span — all named. The submit is the
+				-- sole UNNAMED button, on every card shape seen live.
+				set hits to {}
+				repeat with i from (anchor + 1) to (count of kidList)
+					set r to ""
+					try
+						set r to (item i of roleList) as text
+					end try
+					if r is "AXSplitter" then exit repeat
+					if r is "AXButton" then
+						set n to ""
+						try
+							if (item i of nameList) is not missing value then set n to (item i of nameList) as text
+						end try
+						if n is "" then set end of hits to (item i of kidList)
+					end if
+				end repeat
+				if (count of hits) is 1 then return item 1 of hits
+				error "found the Other response box but " & (count of hits) & " unnamed submit candidates beside it - refusing to guess"
+			end if
+			repeat with i from 1 to (count of kidList)
+				set r to ""
+				try
+					set r to (item i of roleList) as text
+				end try
+				if r is not "AXStaticText" and r is not "AXImage" and r is not "AXButton" and r is not "AXLink" and r is not "AXMenu" then set end of stack to (item i of kidList)
+			end repeat
+		end if
+	end repeat
+	return missing value
+end questionSubmitButton
+
+on scrapeCurrentOptions()
+	-- The displayed question's options: AXRadioButtons named "<digit> …" — the
+	-- leading digit is the discriminator against every other radio in the pane.
+	set opts to {}
+	repeat with c in my chatPressables()
+		if (my axRole(c)) is "AXRadioButton" then
+			set n to my axName(c)
+			if n is not "" and "0123456789" contains (character 1 of n) then set end of opts to n
+		end if
+	end repeat
+	return opts
+end scrapeCurrentOptions
+
+on pressNavButton(navLabel)
+	-- Question nav presses change which question is DISPLAYED, never an answer
+	-- (verified live) — which is what makes a full-card scrape a read.
+	set hits to my matchControls(my chatPressables(), navLabel)
+	if (count of hits) is not 1 then error "couldn't find the " & quote & navLabel & quote & " button"
+	tell application "System Events" to tell process "Conductor"
+		perform action "AXPress" of item 1 of hits
+	end tell
+	delay 0.45
+end pressNavButton
+
+on readInputCard()
+	-- Scrape the live question/plan card off the pane: the read for agents
+	-- (codex) whose cards never reach conductor.db at all (verified live
+	-- 2026-08-18 — the DB has no row; only AX can see the card). A
+	-- multi-question card is walked question-by-question via its nav buttons
+	-- (display-only presses) so EVERY question's options come back — the
+	-- caller must collect one answer per question before anything submits,
+	-- because a codex submit finalizes the whole card at once. Output:
+	-- "question" / "nav <n>" / per question a "q" line then its options; or
+	-- "plan"; or "none".
+	set cands to my chatPressables()
+	set navCount to 0
+	set hasApprove to false
+	set approveLabels to my splitLines(system attribute "RELAY_APPROVE_LABELS")
+	repeat with c in cands
+		set r to my axRole(c)
+		set n to my axName(c)
+		if r is "AXButton" and n is not "" then
+			if n starts with "Question " then set navCount to navCount + 1
+			repeat with entry in approveLabels
+				if (entry as text) is not "" and n is (entry as text) then set hasApprove to true
+			end repeat
+		end if
+	end repeat
+	set firstOpts to my scrapeCurrentOptions()
+	if (count of firstOpts) is 0 then
+		if hasApprove then return "plan"
+		return "none"
+	end if
+	if navCount is 0 then
+		return "question" & linefeed & "nav 0" & linefeed & "q" & linefeed & my joinList(firstOpts, linefeed)
+	end if
+	set out to "question" & linefeed & "nav " & navCount
+	repeat with q from 1 to navCount
+		my pressNavButton("Question " & q)
+		set out to out & linefeed & "q" & linefeed & my joinList(my scrapeCurrentOptions(), linefeed)
+	end repeat
+	-- Come home so the card is left where answering (or the human) expects it.
+	my pressNavButton("Question 1")
+	return out
+end readInputCard
+
+on selectScrapedOption(labelText)
+	set hits to my matchControls(my chatPressables(), labelText)
+	if (count of hits) is not 1 then error "option " & quote & labelText & quote & " is missing or ambiguous - controls seen: " & my pressableEvidence(my chatPressables())
+	tell application "System Events" to tell process "Conductor"
+		perform action "AXPress" of item 1 of hits
+	end tell
+	delay 0.3
+end selectScrapedOption
+
+on pressScrapedAnswers()
+	-- One submit finishes the WHOLE codex card (measured live 2026-08-18:
+	-- submitting with only question 1 answered resolved questions 2 and 3 to
+	-- their recommended defaults — codex cards are not Claude's
+	-- advance-per-submit). So: select every question's radio via the nav
+	-- first, and only then press submit, exactly once.
+	set wanted to my splitLines(do shell script "cat " & quoted form of (system attribute "RELAY_ANSWER_FILE"))
+	if (count of wanted) is 0 then error "no answer labels provided"
+	if (count of wanted) is 1 then
+		my selectScrapedOption(item 1 of wanted)
+	else
+		repeat with q from 1 to (count of wanted)
+			my pressNavButton("Question " & q)
+			my selectScrapedOption(item q of wanted)
+		end repeat
+	end if
+	set submitBtn to my questionSubmitButton()
+	if submitBtn is missing value then error "couldn't find the submit button"
+	tell application "System Events" to tell process "Conductor"
+		perform action "AXPress" of submitBtn
+	end tell
+	delay 0.6
+end pressScrapedAnswers
+
+on silentReadInputCard()
+	-- silentSend's twin for the card scrape: pane already right -> read from
+	-- the background, no activate, no stolen focus. "unavailable" (not an
+	-- error) tells the caller the chat isn't on screen, so an opt-in silent
+	-- read can answer 409 instead of yanking the Mac's focus.
+	try
+		if not (my hasWindow()) then return "unavailable"
+		if not (my atTargetWorkspace()) then return "unavailable"
+		my selectChatTab()
+		return my readInputCard()
+	on error
+		return "unavailable"
+	end try
+end silentReadInputCard
+
+on pressAnswerOption()
+	-- Answer the question card: press each requested option label (Conductor
+	-- renders them as radio buttons named "<n> <label>", so the containing match
+	-- in matchControls does the tolerating), then press the card's submit —
+	-- selection and submission are separate controls (verified live: a radio
+	-- press alone never produces the tool_result receipt). Landing the wrong
+	-- answer is worse than not answering, so a missing or ambiguous label aborts
+	-- in words; the server's receipt check decides success.
+	-- Labels arrive via a temp file, NOT an env var: `system attribute` decodes
+	-- env bytes as MacRoman, so any non-ASCII label (an em-dash was the live
+	-- failure) mojibakes and never matches. `do shell script` output is UTF-8.
+	set wanted to my splitLines(do shell script "cat " & quoted form of (system attribute "RELAY_ANSWER_FILE"))
+	if (count of wanted) is 0 then error "no answer labels provided"
+	-- One label per question, submitted per question: a multi-question card shows
+	-- ONE question's radios at a time and advances on submit, with "Question <n>"
+	-- nav buttons to jump between them (all verified live). Start from Question 1
+	-- — the strip holds its place, so whatever the Mac last looked at is where it
+	-- sits — then select-then-submit down the list; the receipt only exists after
+	-- the last one. A label the strip doesn't offer errors with evidence — which
+	-- is also what catches the card answered from the Mac mid-sequence.
+	if (count of wanted) > 1 then
+		set navHits to my matchControls(my chatPressables(), "Question 1")
+		if (count of navHits) is 1 then
+			tell application "System Events" to tell process "Conductor"
+				perform action "AXPress" of item 1 of navHits
+			end tell
+			delay 0.6
+		end if
+	end if
+	repeat with entry in wanted
+		set w to (entry as text)
+		if w is not "" then
+			set cands to my chatPressables()
+			set hits to my matchControls(cands, w)
+			if (count of hits) is 0 then error "couldn't find an option named " & quote & w & quote & " in the chat - controls seen: " & my pressableEvidence(cands)
+			if (count of hits) > 1 then error "more than one control matches " & quote & w & quote & " - refusing to guess"
+			tell application "System Events" to tell process "Conductor"
+				perform action "AXPress" of item 1 of hits
+			end tell
+			delay 0.5
+			set submitBtn to my questionSubmitButton()
+			if submitBtn is missing value then error "selected " & quote & w & quote & " but couldn't find the question's submit button"
+			tell application "System Events" to tell process "Conductor"
+				perform action "AXPress" of submitBtn
+			end tell
+			delay 0.7
+		end if
+	end repeat
+end pressAnswerOption
+
+on axDump()
+	-- Diagnostic: role|name for everything under the web area, unnamed pressables
+	-- included — the evidence dump that decides how answer handlers match. Reads
+	-- only; never presses. Properties are fetched in BULK per container (`role of
+	-- UI elements of node` is one Apple event for the whole sibling list) — the
+	-- per-node variant cost ~3 round trips × 900 nodes and blew the ceiling.
+	set wa to my webArea()
+	set out to {}
+	set queue to {wa}
+	set visited to 0
+	repeat while (count of queue) > 0 and visited < 250
+		set node to item 1 of queue
+		if (count of queue) is 1 then
+			set queue to {}
+		else
+			set queue to rest of queue
+		end if
+		set visited to visited + 1
+		set kidList to my axKids(node)
+		if (count of kidList) > 0 then
+			set roleList to {}
+			set nameList to {}
+			set descList to {}
+			tell application "System Events" to tell process "Conductor"
+				try
+					set roleList to role of UI elements of node
+				end try
+				try
+					set nameList to name of UI elements of node
+				end try
+				try
+					set descList to description of UI elements of node
+				end try
+			end tell
+			repeat with i from 1 to (count of kidList)
+				set r to ""
+				try
+					set r to (item i of roleList) as text
+				end try
+				set n to ""
+				try
+					if (item i of nameList) is not missing value then set n to (item i of nameList) as text
+				end try
+				set d to ""
+				try
+					if (item i of descList) is not missing value then set d to (item i of descList) as text
+				end try
+				set end of out to (visited as text) & ": " & r & " | " & n & " | " & d
+			end repeat
+		end if
+		set queue to queue & kidList
+	end repeat
+	return my joinList(out, linefeed)
+end axDump
+
+on pressApprovePlan()
+	-- Approve the plan card: first unique hit among the candidate labels wins.
+	-- The labels ride in on the environment (RELAY_APPROVE_LABELS) so a Conductor
+	-- rename is a writes.ts edit, not a script hunt.
+	set cands to my chatPressables()
+	set wanted to my splitLines(system attribute "RELAY_APPROVE_LABELS")
+	repeat with entry in wanted
+		set w to (entry as text)
+		if w is not "" then
+			set hits to my matchControls(cands, w)
+			if (count of hits) is 1 then
+				tell application "System Events" to tell process "Conductor"
+					perform action "AXPress" of item 1 of hits
+				end tell
+				delay 0.5
+				return
+			end if
+			if (count of hits) > 1 then error "more than one control matches " & quote & w & quote & " - refusing to guess"
+		end if
+	end repeat
+	error "couldn't find the plan's approve button - controls seen: " & my pressableEvidence(cands)
+end pressApprovePlan
 
 on axRole(el)
 	tell application "System Events" to tell process "Conductor"
@@ -1044,26 +1552,196 @@ on waitForMenuWith(root, maxDepth, itemName, attempts)
 	return missing value
 end waitForMenuWith
 
-on dismissMenus()
-	-- Two escapes: one for the submenu, one for the row menu. Leaving either open
-	-- would swallow the next run's keystrokes.
+on closeMenus(maxDepth)
+	-- Close whatever menu is open, AX first and keystroke second. Escape used to be
+	-- the only lever, and it is the one lever an input blocker can eat: a screen
+	-- cover that swallows synthetic keys (MeatLock and friends) leaves the menu
+	-- standing, and a menu left open is not cosmetic — it swallows the next run's
+	-- keystrokes. `AXCancel` is on every one of these menus (read from the live
+	-- element's own action list) and needs no event stream at all, so it goes first.
+	--
+	-- **Whether it worked is not knowable from here, and the tree is why.** An
+	-- AXMenu element that has been opened once *stays in the tree for the life of
+	-- the webview*: after Escape, after AXCancel, after re-pressing its trigger, the
+	-- element is still there with a real position and size, only its geometry
+	-- shifts (measured live, both states large). So "count the AXMenus" answers
+	-- "has one ever been opened", not "is one open", and a verify loop built on it
+	-- reports failure forever — which is exactly what it did: every lever burned
+	-- and every sweep repeated on every call, turning a ~5s model refresh into
+	-- 15-22s. The one time the count *does* fall to zero is the first close after
+	-- the webview loads, and that close was an AXCancel — the only direct evidence
+	-- this lever works at all.
+	--
+	-- So: cancel, look once (cheap, and honest about what it can prove), and press
+	-- Escape anyway when the element is still there. Never poll, and never re-press
+	-- the trigger to "toggle it closed" — with no reliable open/closed read that is
+	-- as likely to *open* a menu as to close one.
+	--
+	-- maxDepth is the caller's, for the same reason every sweep here is capped: the
+	-- transcript hangs off this root. The model picker is a direct child of the web
+	-- area (2); the workspace row menu is a portal a few levels in (4, what
+	-- waitForMenuWith uses).
+	--
+	-- Returns "none" (nothing there), "cancel" (confirmed gone) or "escape" (sent
+	-- the keystroke because it couldn't be confirmed) for the caller to log.
+	set wa to my webArea()
+	set found to my menusUnder(wa, maxDepth)
+	if (count of found) is 0 then return "none"
+	repeat with entry in found
+		set node to contents of entry
+		if "AXCancel" is in (my axActions(node)) then
+			try
+				tell application "System Events" to tell process "Conductor"
+					perform action "AXCancel" of node
+				end tell
+			end try
+		end if
+	end repeat
+	delay 0.35
+	if (count of my menusUnder(wa, maxDepth)) is 0 then return "cancel"
 	tell application "System Events"
 		key code 53
 		delay 0.25
 		key code 53
 	end tell
+	return "escape"
+end closeMenus
+
+on dismissMenus()
+	-- The submenu and the row menu it nests in, both — closeMenus cancels every menu
+	-- it finds and keeps the double Escape this handler always sent.
+	return my closeMenus(4)
 end dismissMenus
+
+on axActions(el)
+	tell application "System Events" to tell process "Conductor"
+		try
+			return name of actions of el
+		on error
+			return {}
+		end try
+	end tell
+end axActions
+
+on headerMatches(el, wanted)
+	-- A section header is a pressable non-link named for its group. Rows are
+	-- AXLinks (excluded outright — a branch title could contain a group's words),
+	-- and the name may carry a count ("In progress 3"), so exact-or-prefix.
+	if (my axRole(el)) is "AXLink" then return false
+	set n to my axName(el)
+	if n is "" then return false
+	if not (n is wanted or n starts with (wanted & " ")) then return false
+	return "AXPress" is in (my axActions(el))
+end headerMatches
+
+on sectionHeaderNamed(wanted)
+	-- Depth ≤3 under the web area, same cap and same reason as the menu sweeps:
+	-- the transcript hangs off this root, and rows sit two levels down, so their
+	-- section headers can't be deeper than this.
+	set wa to my webArea()
+	repeat with lvl1 in (my axKids(wa))
+		set a to contents of lvl1
+		if my headerMatches(a, wanted) then return a
+		repeat with lvl2 in (my axKids(a))
+			set b to contents of lvl2
+			if my headerMatches(b, wanted) then return b
+			repeat with lvl3 in (my axKids(b))
+				set c to contents of lvl3
+				if my headerMatches(c, wanted) then return c
+			end repeat
+		end repeat
+	end repeat
+	return missing value
+end sectionHeaderNamed
+
+on pressSectionHeader(wanted)
+	set header to my sectionHeaderNamed(wanted)
+	if header is missing value then return false
+	tell application "System Events" to tell process "Conductor"
+		perform action "AXPress" of header
+	end tell
+	return true
+end pressSectionHeader
+
+on revealViaSectionHeaders()
+	-- Expand the section that should hold the row. RELAY_WS_GROUP names the group
+	-- the relay derives from the workspace's status, tried first; the rest of
+	-- Conductor's groups follow, because a derived status and the sidebar can
+	-- disagree. A press that doesn't produce the row is undone on the spot — the
+	-- header toggles, so a wrong guess would otherwise fold a section the user had
+	-- open. Only a press that *worked* is recorded for restoreExpandedSections.
+	set candidateTitles to {}
+	set groupHint to system attribute "RELAY_WS_GROUP"
+	if groupHint is not "" then set end of candidateTitles to groupHint
+	repeat with fallbackTitle in {"In progress", "In review", "Backlog", "Done", "Canceled", "Archived"}
+		if (fallbackTitle as text) is not groupHint then set end of candidateTitles to (fallbackTitle as text)
+	end repeat
+	repeat with candidateTitle in candidateTitles
+		set sectionName to candidateTitle as text
+		if my pressSectionHeader(sectionName) then
+			set theRow to missing value
+			repeat with attempt from 1 to 6
+				delay 0.25
+				set theRow to my findSidebarRow()
+				if theRow is not missing value then exit repeat
+			end repeat
+			if theRow is not missing value then
+				set end of gExpandedSections to sectionName
+				return theRow
+			end if
+			my pressSectionHeader(sectionName)
+		end if
+	end repeat
+	return missing value
+end revealViaSectionHeaders
+
+on restoreExpandedSections()
+	-- Collapse what revealViaSectionHeaders opened, best-effort: the header handle
+	-- is re-found by name because a status change just moved rows around under it.
+	repeat with sectionName in gExpandedSections
+		try
+			my pressSectionHeader(sectionName as text)
+		end try
+	end repeat
+	set gExpandedSections to {}
+end restoreExpandedSections
+
+on revealSidebarRow()
+	-- The row, made visible if it wasn't: only rendered rows exist in the AX tree,
+	-- so a collapsed section used to be a dead end. Two escalations, cheapest
+	-- first: Conductor's own workspace link navigates by id and reveals the row's
+	-- section when it focuses the workspace (this is the one path here that
+	-- changes what's on screen — the alternative was failing); then the section
+	-- headers directly. Still missing after both → missing value, and the caller
+	-- reports it in words.
+	set theRow to my findSidebarRow()
+	if theRow is not missing value then return theRow
+	set linkURL to system attribute "RELAY_WS_LINK"
+	if linkURL is not "" then
+		try
+			do shell script "open " & quoted form of linkURL
+		end try
+		repeat with attempt from 1 to 8
+			delay 0.3
+			set theRow to my findSidebarRow()
+			if theRow is not missing value then return theRow
+		end repeat
+	end if
+	return my revealViaSectionHeaders()
+end revealSidebarRow
 
 on setWorkspaceStatus()
 	-- Conductor has no menu-bar or palette command for this, so the only lever is
 	-- the sidebar row's own context menu (Mark as unread / Pin / Set status /
 	-- Rename / Copy link / Archive). Right-clicking the row needs no focus change,
-	-- so unlike a send this never disturbs which workspace is on screen.
+	-- so in the common case this never disturbs which workspace is on screen —
+	-- revealSidebarRow's escalations are the exception, and they put back what
+	-- they moved.
 	set wanted to system attribute "RELAY_SET_STATUS"
 	if wanted is "" then error "no status requested"
-	set theRow to my findSidebarRow()
+	set theRow to my revealSidebarRow()
 	if theRow is missing value then
-		error "couldn't find this workspace in the sidebar — a collapsed section hides its row from Accessibility"
+		error "couldn't find this workspace in the sidebar — its section may be collapsed and its group didn't match any known header"
 	end if
 	-- Scroll it into view first. A row that exists in the AX tree but sits outside
 	-- the sidebar's visible strip accepts AXShowMenu and draws nothing — which is
@@ -1074,9 +1752,13 @@ on setWorkspaceStatus()
 		end try
 	end tell
 	delay 0.4
-	-- Clear anything already open (a picker, or a menu a previous run left behind)
-	-- so the sweep below can only match the one this right-click draws.
-	tell application "System Events" to key code 53
+	-- Clear anything already open (a picker, or a menu a previous run left behind) so
+	-- the sweep below can only match the one this right-click draws. Depth 2, not the
+	-- 4 the sweep below uses: this runs *before* the row menu exists, so a leftover
+	-- picker (a direct child of the web area) is all it can usefully find, and a
+	-- depth-4 sweep is the expensive kind — it walks the transcript, which hangs off
+	-- this same root and grows all session. The Escape inside closeMenus still fires.
+	my closeMenus(2)
 	delay 0.3
 	tell application "System Events" to tell process "Conductor"
 		perform action "AXShowMenu" of theRow
@@ -1088,6 +1770,7 @@ on setWorkspaceStatus()
 	set rowMenu to my waitForMenuWith(my webArea(), 4, "Set status", 6)
 	if rowMenu is missing value then
 		my dismissMenus()
+		my restoreExpandedSections()
 		error "the workspace's menu didn't open — or it no longer offers Set status"
 	end if
 	set statusItem to my menuItemNamed(rowMenu, "Set status")
@@ -1112,6 +1795,7 @@ on setWorkspaceStatus()
 	end repeat
 	if subMenu is missing value then
 		my dismissMenus()
+		my restoreExpandedSections()
 		error "Conductor never offered a status called " & wanted
 	end if
 	set choice to my menuItemNamed(subMenu, wanted)
@@ -1119,4 +1803,5 @@ on setWorkspaceStatus()
 		perform action "AXPress" of choice
 	end tell
 	delay 0.6
+	my restoreExpandedSections()
 end setWorkspaceStatus

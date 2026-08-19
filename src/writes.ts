@@ -55,6 +55,8 @@ export interface SendTarget {
 	sessionId: string | null
 	/** Which chat tab to select once the workspace is focused. Omitted → whichever tab is already active. */
 	tab?: ChatTab
+	/** `sessions.agent_type`, when the caller knows it — the sidecar path addresses the agent by it. */
+	agentType?: string | null
 }
 
 export interface Actuator {
@@ -170,6 +172,43 @@ export async function screenLocked(): Promise<boolean | null> {
 }
 
 /**
+ * Seconds since the human last touched this Mac's keyboard, mouse, or trackpad —
+ * or `null` when the probe can't say. Same permission-free JXA channel as
+ * `screenLocked` (a C call, not an Apple event), same bindFunction rule: the
+ * return here is a plain double, so only the argument types need declaring.
+ */
+export async function secondsSinceUserInput(): Promise<number | null> {
+	const jxa =
+		"ObjC.bindFunction('CGEventSourceSecondsSinceLastEventType', ['double', ['int32', 'uint32']]); String($.CGEventSourceSecondsSinceLastEventType(1, 4294967295))"
+	try {
+		const { stdout } = await exec('osascript', ['-l', 'JavaScript', '-e', jxa], { timeout: 5_000 })
+		const n = Number.parseFloat(stdout.trim())
+		return Number.isFinite(n) && n >= 0 ? n : null
+	} catch {
+		return null
+	}
+}
+
+/**
+ * Hold a UI write until the human's hands have been off the Mac for a beat.
+ * `uiTurn` serializes *our* writes against each other, but not against the
+ * person at the keyboard — and an open menu dies the moment they click (the
+ * status write's one observed failure mode is exactly that contention). Waiting
+ * a few idle seconds costs the phone little and removes most of it. Fail-open on
+ * every edge: a probe that can't answer, a locked screen (no input is coming),
+ * or the cap running out all proceed — this is a courtesy, not a gate.
+ */
+export async function waitForUserIdle(minIdleSeconds: number, capMs: number): Promise<void> {
+	const deadline = Date.now() + capMs
+	for (;;) {
+		const idle = await secondsSinceUserInput()
+		if (idle === null || idle >= minIdleSeconds) return
+		if (Date.now() >= deadline) return
+		await new Promise(resolve => setTimeout(resolve, Math.min(1000, deadline - Date.now())))
+	}
+}
+
+/**
  * The sidecar IPC path — the precise, per-session write. Delivers straight to
  * `sessionId` over Conductor's own dispatch socket (see sidecar.ts), so it needs
  * no window focus and the app UI reflects the turn correctly.
@@ -193,8 +232,16 @@ export class SidecarActuator implements Actuator {
 	async send(target: SendTarget, text: string, _deadline?: number): Promise<SendResult> {
 		const sessionId = target.sessionId ?? target.workspace.active_session_id
 		if (!sessionId) return { ok: false, strategy: this.name, error: 'no session id to target' }
+		if (!target.workspace.worktree) {
+			return { ok: false, strategy: this.name, error: 'workspace worktree could not be resolved' }
+		}
 		try {
-			await sidecarSendUserMessage(sessionId, text)
+			await sidecarSendUserMessage({
+				sessionId,
+				text,
+				cwd: target.workspace.worktree,
+				agentType: target.agentType ?? 'claude'
+			})
 			return { ok: true, strategy: this.name }
 		} catch (err) {
 			return { ok: false, strategy: this.name, error: err instanceof Error ? err.message : String(err) }
@@ -320,6 +367,22 @@ function targetEnv(target: SendTarget): Record<string, string> {
 	}
 }
 
+/**
+ * What a run said on stderr: the handlers' own `log` lines, which is how a step
+ * that *worked around* something reports it — today, which lever finally closed a
+ * menu. Not an error channel; osascript reports those through the exit code and
+ * `osaError` turns them into words. Capped: it becomes a log line, and log lines
+ * are a wire surface here.
+ */
+function scriptNote(stderr: string): string {
+	return stderr
+		.split('\n')
+		.map(s => s.trim())
+		.filter(Boolean)
+		.join('; ')
+		.slice(0, 300)
+}
+
 /** osascript echoes the whole failing script back; keep just the reason for the phone. */
 function osaError(err: unknown): string {
 	const raw = err instanceof Error ? err.message : String(err)
@@ -351,25 +414,35 @@ export class AppleScriptActuator implements Actuator {
 	readonly precise = true
 
 	async send(target: SendTarget, text: string, deadline = Date.now() + SEND_ATTEMPT_MS): Promise<SendResult> {
-		// Open the target workspace's own link, confirm its chat tab, fill the composer, send.
-		// Filling is an Accessibility write (no keystrokes, no clipboard); the
-		// clipboard paste is kept only as a fallback, and stashes/restores around it.
+		// Try the silent path first: when Conductor already shows the target chat, the
+		// whole send is AX reads and presses, which work on a background app — no
+		// activate, no stolen focus (see silentSend in conductor.applescript). Anything
+		// short of that falls into the activation ladder: open the workspace's own
+		// link, confirm its chat tab, fill the composer, send. Filling is an
+		// Accessibility write (no keystrokes, no clipboard); the clipboard paste is
+		// kept only as a fallback, and stashes/restores around it. The final press
+		// prefers the composer's send button and keeps Enter for a build whose button
+		// isn't AX-mapped.
 		const script = `
 ${CONDUCTOR_HANDLERS}
 
-my activateConductor()
-my focusWorkspace()
-my selectChatTab()
 set promptText to my normalizeNewlines(do shell script "cat" & " " & quoted form of (system attribute "RELAY_PROMPT_FILE"))
-if not (my fillComposer(promptText)) then
-	set savedClipboard to the clipboard
-	my pasteComposer()
-	delay 0.1
-	set the clipboard to savedClipboard
+if not (my silentSend(promptText)) then
+	my activateConductor()
+	my focusWorkspace()
+	my selectChatTab()
+	if not (my fillComposer(promptText)) then
+		set savedClipboard to the clipboard
+		my pasteComposer()
+		delay 0.1
+		set the clipboard to savedClipboard
+	end if
+	if not (my pressSendButton()) then
+		tell application "System Events"
+			key code 36
+		end tell
+	end if
 end if
-tell application "System Events"
-	key code 36
-end tell
 `.trim()
 		// Pass the prompt via a temp file + env to avoid AppleScript string escaping.
 		const os = await import('node:os')
@@ -417,6 +490,12 @@ export interface AgentOptions {
 	toggleFast?: boolean
 	/** The model picker's menu label, e.g. "Opus 5" or "Sonnet 4.6". */
 	model?: string
+	/**
+	 * The model's *id* (`sessions.model`), when the caller resolved `model` from
+	 * the catalog — lets the DB confirm the exact value instead of trusting the
+	 * menu label alone. Ignored by the UI drive itself.
+	 */
+	modelId?: string
 }
 
 /**
@@ -432,10 +511,12 @@ export async function setAgentOptions(target: SendTarget, opts: AgentOptions): P
 	const script = `
 ${CONDUCTOR_HANDLERS}
 
-my activateConductor()
-my focusWorkspace()
-my selectChatTab()
-my applyAgentOptions()
+if not (my silentApplyAgentOptions()) then
+	my activateConductor()
+	my focusWorkspace()
+	my selectChatTab()
+	my applyAgentOptions()
+end if
 return "ok"`.trim()
 	try {
 		await uiTurn(() =>
@@ -454,6 +535,198 @@ return "ok"`.trim()
 		return { ok: true, strategy: 'applescript' }
 	} catch (err) {
 		return { ok: false, strategy: 'applescript', error: osaError(err) }
+	}
+}
+
+/** What the phone pressed on a question/plan card (see `answerSession`). */
+export interface AnswerAction {
+	kind: 'question' | 'plan'
+	/** Option labels to press, in order (one for single-select). Ignored for plan approval. */
+	labels: string[]
+	/**
+	 * Scraped (codex) card: select every question's label via the nav, then ONE
+	 * submit — a codex submit finalizes the whole card (measured live
+	 * 2026-08-18: a per-question submit resolved the unanswered questions to
+	 * their defaults). Claude cards keep the per-question submit path.
+	 */
+	scraped?: boolean
+}
+
+/**
+ * Approve-button labels tried in order on the plan card. Nothing documents the
+ * card's AX shape, so a miss errors with every pressable name it *did* see — the
+ * failure is the discovery dump. A rename here is a one-line edit.
+ */
+const APPROVE_LABELS = ['Approve plan', 'Approve']
+
+/**
+ * Answer a pending question or approve a pending plan in one chat: same verified
+ * focus path as a send, then press the card's own buttons by their exact labels.
+ * The caller (server.ts) validates the labels against the live pending read
+ * before this runs and confirms afterwards against the transcript receipt — this
+ * function only ever presses a unique match, and errors in words otherwise.
+ */
+/** The live question/plan card, scraped off the pane (see readInputCard). */
+export interface CardRead {
+	ok: boolean
+	/** 'question' | 'plan' | 'none' — none = no card on the pane right now. */
+	kind?: string
+	/**
+	 * One entry per question, each the full AX option names
+	 * ("1 <label> <description>"). Single-question cards have one entry.
+	 * Answers must send one option per question, verbatim, in order — a codex
+	 * submit finalizes the WHOLE card, so partial answers are never pressed.
+	 */
+	questions?: string[][]
+	/** Count of "Question N" nav buttons — >0 means a multi-question card. */
+	nav?: number
+	/** True when silentOnly was asked and the chat isn't the pane on screen. */
+	notVisible?: boolean
+	error?: string
+}
+
+/**
+ * Read the live card via AX — the only read that exists for codex sessions,
+ * whose cards never touch conductor.db. `silentOnly` never steals focus: it
+ * answers `notVisible` instead when the chat isn't the pane on screen, so the
+ * phone can ask permission before yanking the Mac around.
+ */
+export async function readInputCard(target: SendTarget, silentOnly: boolean): Promise<CardRead> {
+	const body = silentOnly
+		? 'return my silentReadInputCard()'
+		: `set got to my silentReadInputCard()
+if got is "unavailable" then
+	my activateConductor()
+	my focusWorkspace()
+	my selectChatTab()
+	set got to my readInputCard()
+end if
+return got`
+	const script = `
+${CONDUCTOR_HANDLERS}
+
+${body}`.trim()
+	try {
+		const { stdout } = await uiTurn(() =>
+			exec('osascript', ['-e', script], {
+				env: { ...process.env, ...targetEnv(target), RELAY_APPROVE_LABELS: APPROVE_LABELS.join('\n') },
+				timeout: SEND_ATTEMPT_MS
+			})
+		)
+		const lines = stdout.split('\n').map(s => s.trim())
+		switch (lines[0]) {
+			case 'unavailable':
+				return { ok: false, notVisible: true, error: 'the chat is not on screen on the Mac' }
+			case 'plan':
+				return { ok: true, kind: 'plan' }
+			case 'none':
+				return { ok: true, kind: 'none' }
+			case 'question': {
+				const nav = Number((lines[1] ?? '').replace('nav ', '')) || 0
+				// "q" starts a question's section; its options follow.
+				const questions: string[][] = []
+				for (const line of lines.slice(2)) {
+					if (line === 'q') questions.push([])
+					else if (line && questions.length) questions[questions.length - 1]?.push(line)
+				}
+				if (!questions.length || questions.some(q => !q.length)) {
+					return { ok: false, error: 'scraped a question card with an empty question — refusing to act on it' }
+				}
+				return { ok: true, kind: 'question', questions, nav }
+			}
+			default:
+				return { ok: false, error: `unexpected card read: ${lines[0] ?? '(empty)'}` }
+		}
+	} catch (err) {
+		return { ok: false, error: osaError(err) }
+	}
+}
+
+export async function answerSession(target: SendTarget, action: AnswerAction): Promise<SendResult> {
+	// One built-in refocus-and-retry: the human clicking to another workspace
+	// between the focus and the scan is this write's observed failure mode (the
+	// scan then dumps the wrong pane's controls), and one refocus beats handing
+	// the phone an error for a race the next attempt wins anyway.
+	const press =
+		action.kind === 'plan'
+			? 'my pressApprovePlan()'
+			: action.scraped
+				? 'my pressScrapedAnswers()'
+				: 'my pressAnswerOption()'
+	// Silent fast path first (see silentAnswer): pane already right → press in
+	// the background, ~2s and no focus steal. Anything short of certainty falls
+	// through to the full activation ladder below.
+	const script = `
+${CONDUCTOR_HANDLERS}
+
+if not (my silentAnswer(${action.kind === 'plan' ? 'true' : 'false'})) then
+	my activateConductor()
+	my focusWorkspace()
+	my selectChatTab()
+	try
+		${press}
+	on error firstErr
+		my focusWorkspace()
+		my selectChatTab()
+		${press}
+	end try
+end if
+return "ok"`.trim()
+	// Labels ride a temp file, not the environment: AppleScript's
+	// `system attribute` decodes env bytes as MacRoman, so a non-ASCII label
+	// (an em-dash, live) mojibakes into a string no control matches. The file
+	// is read back with `do shell script cat`, which decodes UTF-8 — the same
+	// dodge deliverPrompt uses for the prompt text.
+	const os = await import('node:os')
+	const fs = await import('node:fs/promises')
+	const path = await import('node:path')
+	const tmp = path.join(os.tmpdir(), `relay-answer-${process.pid}-${Date.now()}.txt`)
+	await fs.writeFile(tmp, action.labels.join('\n'), 'utf8')
+	try {
+		await uiTurn(() =>
+			exec('osascript', ['-e', script], {
+				env: {
+					...process.env,
+					...targetEnv(target),
+					RELAY_ANSWER_FILE: tmp,
+					RELAY_APPROVE_LABELS: APPROVE_LABELS.join('\n')
+				},
+				timeout: SEND_ATTEMPT_MS
+			})
+		)
+		return { ok: true, strategy: 'applescript' }
+	} catch (err) {
+		return { ok: false, strategy: 'applescript', error: osaError(err) }
+	} finally {
+		await fs.rm(tmp, { force: true }).catch(() => undefined)
+	}
+}
+
+/**
+ * Diagnostic AX dump of whatever pane Conductor currently shows — role, name and
+ * description of everything under the web area, unnamed pressables included.
+ * Reads only, never presses, no activate (AX reads work on a background app).
+ * This is how an undocumented card shape (the answer/approve buttons) gets
+ * discovered from a shell that has no Automation grant of its own.
+ */
+export async function axDump(target?: SendTarget): Promise<{ ok: boolean; dump?: string; error?: string }> {
+	// With a target: the same verified focus path as a send, so the dump is of the
+	// chat in question rather than whatever pane the human left on screen.
+	const script = `
+${CONDUCTOR_HANDLERS}
+
+${target ? 'my activateConductor()\nmy focusWorkspace()\nmy selectChatTab()' : ''}
+return my axDump()`.trim()
+	try {
+		const { stdout } = await uiTurn(() =>
+			exec('osascript', ['-e', script], {
+				env: target ? { ...process.env, ...targetEnv(target) } : process.env,
+				timeout: 30000
+			})
+		)
+		return { ok: true, dump: stdout }
+	} catch (err) {
+		return { ok: false, error: osaError(err) }
 	}
 }
 
@@ -476,15 +749,19 @@ export const WORKSPACE_STATUS_LABELS: Record<string, string> = {
  * Move a workspace between the sidebar's status groups — the thing a merged PR
  * that Conductor never linked can't do for itself.
  *
- * Unlike every other write here this one never changes what's on screen: it
- * right-clicks the workspace's *row* (AXShowMenu) and works the menu, so the
- * workspace you were reading stays open. It does need the row to be rendered,
- * which a collapsed sidebar section prevents — that case is reported in words
- * rather than guessed around, because there is no palette command to fall back to.
+ * In the common case this never changes what's on screen: it right-clicks the
+ * workspace's *row* (AXShowMenu) and works the menu, so the workspace you were
+ * reading stays open. A row hidden by a collapsed sidebar section is no longer a
+ * dead end: `revealSidebarRow` escalates — the workspace's own deep link first
+ * (which does change the screen; failing was the alternative), then expanding
+ * the section header the row should sit under, restored afterward.
+ * RELAY_WS_GROUP carries the group to try first, from the same status the
+ * sidebar groups by.
  */
 export async function setWorkspaceStatus(workspace: Workspace, status: string): Promise<SendResult> {
 	const label = WORKSPACE_STATUS_LABELS[status]
 	if (!label) return { ok: false, strategy: 'applescript', error: `unknown status ${status}` }
+	const currentGroup = WORKSPACE_STATUS_LABELS[workspace.manual_status ?? workspace.derived_status ?? ''] ?? ''
 	const script = `
 ${CONDUCTOR_HANDLERS}
 
@@ -497,9 +774,10 @@ return "ok"`.trim()
 				env: {
 					...process.env,
 					...targetEnv({ workspace, sessionId: null }),
-					RELAY_SET_STATUS: label
+					RELAY_SET_STATUS: label,
+					RELAY_WS_GROUP: currentGroup
 				},
-				timeout: 25000
+				timeout: 35000
 			})
 		)
 		return { ok: true, strategy: 'applescript' }
@@ -518,12 +796,17 @@ my focusWorkspace()
 my selectChatTab()
 return my listModels()`.trim()
 	try {
-		const { stdout } = await uiTurn(() =>
+		const { stdout, stderr } = await uiTurn(() =>
 			exec('osascript', ['-e', script], {
 				env: { ...process.env, ...targetEnv(target) },
 				timeout: SEND_ATTEMPT_MS
 			})
 		)
+		// How the picker got closed, from the handler's own `log`. Worth a line: the
+		// menu is opened for this read alone, and "only Escape closed it" is the early
+		// warning that an input blocker is eating the keystroke fallback.
+		const note = scriptNote(stderr)
+		if (note) console.log(`models: ${note}`)
 		const models = stdout
 			.split('\n')
 			.map(s => s.trim())
@@ -581,6 +864,31 @@ export async function createWorkspace(prompt: string, repoPath: string | null): 
  * Open a new chat in the target workspace — Conductor's "New chat, same files"
  * (Cmd+T). Focuses the workspace first (its own link, see `workspaceLink`), then
  * Cmd+T; the caller detects the freshly-created session id from the DB.
+ *
+ * **This is the one operation here with no Accessibility path, and it is not for
+ * want of looking.** Everything else in this file was made AX-first so that an
+ * input blocker — a screen cover that swallows synthetic keystrokes while agents
+ * keep working — can't take it out; new chat resisted, and the reasons are worth
+ * keeping because they look like bugs from a distance (all measured live through
+ * `GET /api/debug/ax` against Conductor 0.8x):
+ *  - The chat strip *does* carry a "+": the sole unnamed `AXButton` among the tab
+ *    group's direct children (the others are one `AXGroup` per tab), sitting 24×24
+ *    immediately right of the last tab. It advertises `AXPress`. **Pressing it does
+ *    nothing** — no new tab, no new `sessions` row, no menu, twice over. The
+ *    chevron beside it (an unnamed `AXPopUpButton` in the same row) ignores
+ *    `AXPress` the same way.
+ *  - That is not a dead pane or a stale handle: in the same run, `AXPress` on a
+ *    chat tab's own radio button switches tabs, and `AXPress` on the composer's
+ *    model picker opens its menu. So the row is drivable and these two controls
+ *    specifically are not — they read as trigger components wired to pointer
+ *    events, which `AXPress`'s synthetic click doesn't satisfy.
+ *  - There is no menu-bar command to fall back on: Conductor's File menu holds
+ *    only Close Window / Close All (its whole menu bar was enumerated).
+ * A real mouse click at the button's coordinates would presumably work, and is
+ * exactly the wrong tool: a screen cover swallows clicks with its own overlay, so
+ * it fails in the one case this would exist for — and it steals the pointer in
+ * every other case. So Cmd+T stays, and "new chat while locked" is a thing only
+ * the blocker's own keystroke passthrough can fix, not the relay.
  */
 export async function newChat(workspace: Workspace): Promise<SendResult> {
 	if (!focusQuery(workspace)) return { ok: false, strategy: 'applescript', error: 'workspace has no branch to focus' }

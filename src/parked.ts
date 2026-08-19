@@ -50,6 +50,8 @@ export interface ParkedPrompt {
 	reason: string
 	/** Why it was given up on — shown beside the undelivered text. */
 	error?: string
+	/** The one behind-the-lock delivery (`deliverLocked`) was already spent on this entry. */
+	lockedAttempted?: boolean
 }
 
 /** What the queue needs from the outside world; injected so this module stays testable and Mac-free. */
@@ -61,6 +63,12 @@ export interface ParkedDeps {
 	 * then the prompt). `blocked` = the lock got in the way again — wait, don't count.
 	 */
 	deliver: (entry: ParkedPrompt) => Promise<{ ok: boolean; error?: string; blocked?: boolean }>
+	/**
+	 * Optional: a delivery path that works *behind* the lock (the sidecar socket —
+	 * see server.ts, opt-in). Tried once per entry while locked; a failure just
+	 * means waiting for the unlock as usual, so it never counts as an attempt.
+	 */
+	deliverLocked?: (entry: ParkedPrompt) => Promise<{ ok: boolean; error?: string }>
 	/** Tell the phone how it ended — a push, since the whole point is nobody is watching. */
 	notify: (entry: ParkedPrompt, error?: string) => void
 }
@@ -165,6 +173,7 @@ export class ParkedPromptQueue {
 		try {
 			while (this.entries.some(e => e.status === 'waiting')) {
 				if ((await this.deps.locked()) === true) {
+					await this.tryLockedDeliveries()
 					await sleep(POLL_MS)
 					continue
 				}
@@ -176,6 +185,31 @@ export class ParkedPromptQueue {
 			console.error('[relay] parked-prompt delivery loop crashed:', err)
 		} finally {
 			this.pumping = false
+		}
+	}
+
+	/**
+	 * One `deliverLocked` try per entry while the lock is up. Single-shot on
+	 * purpose: the path behind it perturbs Conductor's own event channel (see
+	 * server.ts), so a failure falls back to the unlock wait rather than retrying
+	 * into it — and never counts toward `attempts`, which measure real unlocked
+	 * failures only.
+	 */
+	private async tryLockedDeliveries(): Promise<void> {
+		const hook = this.deps.deliverLocked
+		if (!hook) return
+		for (const entry of this.entries.filter(e => e.status === 'waiting' && !e.lockedAttempted)) {
+			entry.lockedAttempted = true
+			this.save()
+			const result = await hook(entry)
+			if (result.ok) {
+				console.info(`[relay] parked prompt for ${entry.sessionId} delivered behind the lock via sidecar`)
+				this.delivered(entry)
+			} else {
+				console.warn(
+					`[relay] behind-the-lock delivery for ${entry.sessionId} didn’t land (${result.error ?? 'unknown'}) — waiting for unlock`
+				)
+			}
 		}
 	}
 

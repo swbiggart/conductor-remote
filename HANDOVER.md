@@ -65,19 +65,30 @@ bakes the absolute `node` path, so re-run `yarn deploy` after an nvm upgrade.
 
 ## Open work, in priority order
 
-1. **Validate the sidecar send live.** `WRITE_STRATEGY=sidecar`, send one prompt
-   from the phone to a session you're watching, confirm it lands in the right
-   agent and the UI reflects it. If clean, make sidecar the default in
-   `src/config.ts` (`loadConfig` → `writeStrategy`).
+1. **Sidecar** — superseded by the 0.81 re-derivation: the socket is
+   single-client (connecting steals the app's event tunnel), so it must not
+   become the default. Current state and the gated locked-Mac experiment live
+   in CLAUDE.md ▸ writes ▸ `sidecar` and `scripts/sidecar-probe.ts`.
 2. **Visual QA on a real phone.** The build + all endpoints are verified, but the
    UI hasn't been screenshotted on-device (browser automation needs an
    interactive Chrome connect this session couldn't do). Check the list, session
    tabs (Chat/Diff), composer, and install/standalone appearance.
 3. **SSE push** instead of ~2s polling (optional; polling is fine over a
    LAN/tailnet and simpler).
-4. **Session picker.** The API returns all sessions per workspace
-   (`/api/workspaces/:id/sessions`); the PWA opens the active one. Add a picker
-   for history/side sessions.
+4. **Transcript polish, remaining tier:** real syntax highlighting in the
+   step hunks and the diff views (a Swift highlighter package on iOS;
+   shiki/hljs bundle weight on the PWA — neither client has one today).
+
+Done 2026-08-15 (the transcript-polish queue): per-edit `+N −M` chips with
+tap-to-expand clipped hunks and end-of-turn summaries (duration + per-file
+totals over `turn_id`), live steps streaming individually until the turn ends,
+image steps and user attachments as chips that open the file through
+`GET /api/sessions/:id/file` (transcript-gated, images only), and coarse
+single-unit timestamps in the prompt navigator. Relay: `transcript.ts`
+(`editDiff`/`diffStrings`, `turnId`), `server.ts` (file endpoint); clients:
+`Transcript.tsx` / `Grouping.swift` + `TranscriptView.swift` (fold tests cover
+the live-unfold and summary rules). The PWA has had chat tabs since the session
+picker item was written, so that item is retired.
 
 ## File map
 
@@ -91,8 +102,9 @@ src/              Node relay (dev: run as .ts via Node type-stripping; tarball: 
   transcript.ts   Claude Code SDK stream JSON → phone-renderable entries
   git.ts          workspace diff vs target branch (incl. untracked via --no-index)
   merge.ts        merge the workspace's open PR via `gh pr merge` (mirrors Conductor's Merge button)
-  sidecar.ts      Conductor sidecar IPC client (JSON-RPC over unix socket)
-  writes.ts       Actuator: AppleScript (default) + Sidecar (opt-in); uiTurn() serializes UI ops
+  sidecar.ts      Conductor sidecar IPC client (JSON-RPC over unix socket; 0.81 query schema, single-client tunnel caveat)
+  modelcatalog.ts model list extracted from conductor-runtime's bundled schema (ids per agent family, keyed on binary identity)
+  writes.ts       Actuator: AppleScript (default) + Sidecar (opt-in); uiTurn() serializes UI ops; waitForUserIdle()
   firstprompt.ts  persisted queue that delivers a new workspace's first prompt once it's ready
   parked.ts       persisted queue for prompts that hit the lock screen — delivers on unlock, pushes the receipt
   notify.ts       status-transition watcher + subscription store (~/…/conductor-remote/push.json, 0600)
@@ -115,6 +127,7 @@ public/           icon.svg source + PWA PNGs (repo-root so Conductor's icon look
   self-heal.js    HTML-level stale-client watchdog (see PWA-update note below)
   push-sw.js      push / notificationclick handlers, pulled into the generated SW by workbox.importScripts
 scripts/dev.ts + gen-icons.ts + service.ts (macOS LaunchAgent install/uninstall/status) + qr.ts (dep-free QR of the phone URL, printed by service.ts)
+scripts/sidecar-probe.ts  supervised (human-run, watching Conductor) probe of sidecar tunnel recovery — gates SIDECAR_WHEN_LOCKED
 dist/             built PWA (gitignored) — what the relay serves
 dist-node/        compiled relay (gitignored) — src/ + service.ts/qr.ts → JS for the npm tarball
 ```

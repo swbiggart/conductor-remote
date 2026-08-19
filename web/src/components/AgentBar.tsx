@@ -1,8 +1,11 @@
+import { useQueryClient } from '@tanstack/react-query'
 import { Check, ChevronDown, RefreshCw, Zap } from 'lucide-react'
 import { useState } from 'react'
 import { useModels } from '../hooks.ts'
+import { client } from '../lib/api.ts'
 import { cn } from '../lib/cn.ts'
 import { shortModel } from '../lib/format.ts'
+import { idToLabel, labelToId, writeModelCache } from '../lib/models.ts'
 import type { AgentPatch, Session } from '../lib/types.ts'
 import { useApp } from '../store.ts'
 
@@ -37,9 +40,12 @@ function change<T>(next: T, current: T): T | undefined {
 }
 
 /**
- * The pill shows the DB's model id (`opus-5-1m`) while the picker lists Conductor's
- * menu labels (`Opus 5 NEW`). There's no reliable mapping between the two, so the
- * list marks the *staged* entry only, rather than mark the wrong one as current.
+ * The pill shows the DB's model id (`opus-5-1m`) prettified through the cached
+ * id↔label map when it can be; the picker lists labels and stages *ids*, so a
+ * staged value is directly comparable to `sessions.model` (which is also what
+ * lets the store's reconcile drop a draft the Mac has caught up with). Labels
+ * with no mapping — a live menu read, an older relay — pass through as labels,
+ * the legacy currency the relay still accepts.
  */
 function modelPill(session: Session): string {
 	const raw = shortModel(session.model)
@@ -56,8 +62,30 @@ export function AgentBar({ session, workspaceId }: { session: Session; workspace
 	// the store's key-wise `clearAgentDraft` is what makes safe.
 	const sending = useApp(s => s.pending.some(p => p.sessionId === session.id && p.status === 'sending'))
 	const { data: models, isFetching, isError } = useModels(session, workspaceId, picking)
+	const agentType = session.agent_type ?? 'claude'
+	const queryClient = useQueryClient()
+	const [refreshing, setRefreshing] = useState(false)
+	const [refreshError, setRefreshError] = useState<string | null>(null)
 
 	const stage = (patch: AgentPatch) => stageAgent(session.id, patch)
+
+	// The one deliberately expensive tap: opens the real picker on the Mac. For a
+	// catalog that disagrees with the live menu (an account-gated model, a renamed
+	// label) — the escape hatch, not the default.
+	const refreshLive = async () => {
+		setRefreshing(true)
+		setRefreshError(null)
+		try {
+			const r = await client.models(session.id, workspaceId, true)
+			if (!r.ok || !r.models?.length) throw new Error(r.error ?? 'could not read the model list')
+			writeModelCache(agentType, r.models, Date.now(), r.entries)
+			queryClient.setQueryData(['models', agentType], r.models)
+		} catch (err) {
+			setRefreshError(err instanceof Error ? err.message : String(err))
+		} finally {
+			setRefreshing(false)
+		}
+	}
 
 	const dbEffort = session.claude_effort_level ?? undefined
 	const dbPlan = session.permission_mode === 'plan'
@@ -79,9 +107,11 @@ export function AgentBar({ session, workspaceId }: { session: Session; workspace
 					<button
 						type="button"
 						onClick={() => setPicking(p => !p)}
-						className={cn('ctl flex max-w-40 items-center gap-1', staged.model && 'ctl-staged')}
+						className={cn('ctl flex max-w-40 items-center gap-1', staged.model && 'ctl-staged ctl-staged-on')}
 					>
-						<span className="truncate">{staged.model ?? modelPill(session)}</span>
+						<span className="truncate">
+							{staged.model ? (idToLabel(agentType, staged.model) ?? staged.model) : modelPill(session)}
+						</span>
 						<ChevronDown size={13} className="shrink-0" />
 					</button>
 					{picking ? (
@@ -99,29 +129,48 @@ export function AgentBar({ session, workspaceId }: { session: Session; workspace
 									{isFetching ? <RefreshCw size={10} className="animate-spin" /> : null}
 								</div>
 								{models?.length ? (
-									models.map(m => (
-										<button
-											type="button"
-											key={m}
-											onClick={() => {
-												setPicking(false)
-												stage({ model: change(m, staged.model) })
-											}}
-											className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm active:bg-surface"
-										>
-											<span className="min-w-0 flex-1 truncate">{m}</span>
-											<Check size={13} className={cn('shrink-0 text-accent', staged.model !== m && 'invisible')} />
-										</button>
-									))
+									models.map(m => {
+										// Rows show labels and stage ids when the mapping is known;
+										// with ids, "current" is markable and tapping it stages nothing.
+										const rowValue = labelToId(agentType, m) ?? m
+										const dbModel = session.model ?? undefined
+										const selected = staged.model ? rowValue === staged.model : rowValue === dbModel
+										return (
+											<button
+												type="button"
+												key={m}
+												onClick={() => {
+													setPicking(false)
+													stage({
+														model: rowValue === staged.model || rowValue === dbModel ? undefined : rowValue
+													})
+												}}
+												className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm active:bg-surface"
+											>
+												<span className="min-w-0 flex-1 truncate">{m}</span>
+												<Check size={13} className={cn('shrink-0 text-accent', !selected && 'invisible')} />
+											</button>
+										)
+									})
 								) : (
 									<div className="px-3 py-2 text-sm text-muted">
-										{isError ? 'Couldn’t read the model list.' : 'Reading Conductor’s model list…'}
+										{isError ? 'Couldn’t read the model list.' : 'Reading the model list…'}
 									</div>
 								)}
 								{/* A refresh that failed on top of a cached list: say so, keep the list usable. */}
 								{isError && models?.length ? (
 									<div className="px-3 py-1.5 text-[11px] text-del">Couldn’t refresh — showing the last list.</div>
 								) : null}
+								<button
+									type="button"
+									onClick={refreshLive}
+									disabled={refreshing}
+									className="flex w-full items-center gap-2 border-border border-t px-3 py-2 text-left text-[12px] text-muted active:bg-surface"
+								>
+									<RefreshCw size={12} className={cn('shrink-0', refreshing && 'animate-spin')} />
+									{refreshing ? 'Reading Conductor’s menu…' : 'Refresh from Conductor'}
+								</button>
+								{refreshError ? <div className="px-3 py-1.5 text-[11px] text-del">{refreshError}</div> : null}
 							</div>
 						</>
 					) : null}
@@ -130,22 +179,31 @@ export function AgentBar({ session, workspaceId }: { session: Session; workspace
 					<button
 						type="button"
 						onClick={() => stage({ effort: change(nextEffort(), dbEffort) })}
-						className={cn('ctl', staged.effort && 'ctl-staged')}
+						className={cn('ctl', staged.effort && 'ctl-staged ctl-staged-on')}
 					>
 						{EFFORT_LABELS[effort]}
 					</button>
 				) : null}
+				{/* Fill = the value the next prompt runs with; dashed outline = staged.
+				    Solid is reserved for Conductor's own state, so a staged-to-on pill
+				    (tinted + dashed) can't be mistaken for already-on. */}
 				<button
 					type="button"
 					onClick={() => stage({ plan: change(!planOn, dbPlan) })}
-					className={cn('ctl', planOn && 'ctl-on', staged.plan !== undefined && 'ctl-staged')}
+					className={cn(
+						'ctl',
+						staged.plan === undefined ? planOn && 'ctl-on' : cn('ctl-staged', planOn && 'ctl-staged-on')
+					)}
 				>
 					Plan
 				</button>
 				<button
 					type="button"
 					onClick={() => stage({ fast: change(!fastOn, dbFast) })}
-					className={cn('ctl flex items-center gap-1', fastOn && 'ctl-on', staged.fast !== undefined && 'ctl-staged')}
+					className={cn(
+						'ctl flex items-center gap-1',
+						staged.fast === undefined ? fastOn && 'ctl-on' : cn('ctl-staged', fastOn && 'ctl-staged-on')
+					)}
 				>
 					<Zap size={13} />
 					Fast

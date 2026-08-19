@@ -242,13 +242,51 @@ Two asymmetric halves — keep them separate:
        count + label and a tie aborts, so we never type into a terminal.
     4. **Composer** — `AXGroup "composer"` holds an `AXTextArea` whose `AXFocused`
        and `AXValue` are both settable, so the prompt is *written*, read back to
-       verify, then Enter. No clipboard hijack, no Cmd+L/Cmd+V. Clipboard paste
-       survives only as a fallback — and `fillComposer` **clears whatever it wrote
-       before falling back**, or the paste appends and sends a garbled prompt.
+       verify, then sent — preferring an `AXPress` on the composer's own send
+       button (`pressSendButton`: only a *unique* button whose name says send) and
+       keeping Enter for a build whose button isn't AX-mapped. No clipboard
+       hijack, no Cmd+L/Cmd+V. Clipboard paste survives only as a fallback — and
+       `fillComposer` **clears whatever it wrote before falling back**, or the
+       paste appends and sends a garbled prompt.
+
+    **The whole ladder is also skippable** (`silentSend`): AX reads, sets and
+    presses work on a *background* app, so when Conductor already shows the target
+    chat — the common case, checked with the same pane assertion — the send runs
+    with no `activate` at all: no stolen focus, the human keeps typing wherever
+    they were. Anything short of that (no window, which is also the locked and
+    full-screen-Space case; wrong pane; no send button) returns false and the
+    activation ladder takes over, so the fast path can only ever save disruption.
+    The card answer (`silentAnswer`) and agent settings (`silentApplyAgentOptions`)
+    have the same twin — the settings one **opts out when a model change is
+    requested**, because that opens the real picker menu and menus are the one AX
+    surface with known ghost behaviour (`closeMenus`), never probed from the
+    background. `newChat` can never join them: Cmd+T is its only mechanism
+    (measured — the strip's "+" ignores synthetic presses) and keystrokes need a
+    frontmost app.
+    Queue deliveries additionally wait for idle hands (`waitForUserIdle` — a
+    background send should never fight the human for the UI), as does the status
+    write; a phone-initiated send stays immediate.
 
     Landing in the wrong agent is worse than not sending, so every step errors out
     rather than guessing. No private protocol, nothing to rebreak on a Conductor
     update. The remaining keystroke delays (palette fallback) are load-bearing.
+
+    **`newChat` is the one operation with no Accessibility path, and that was
+    measured, not assumed.** Everything else here is AX reads and presses, which no
+    event tap sees; Cmd+T is the only mechanism this one has, so an input blocker
+    that swallows synthetic keystrokes takes it out entirely. The chat strip *does*
+    carry a "+" — the sole unnamed `AXButton` among the tab group's direct children
+    (the others are one `AXGroup` per tab), 24×24, immediately right of the last
+    tab, advertising `AXPress` — and **pressing it does nothing**: no tab, no
+    `sessions` row, no menu. Same for the unnamed `AXPopUpButton` beside it. That
+    isn't a dead pane: in the same run `AXPress` switches chat tabs and opens the
+    composer's model menu, so these two controls specifically ignore a synthetic
+    click (they read as pointer-event triggers). Conductor's File menu offers only
+    Close Window / Close All, so there is no menu command to press either. A real
+    mouse click at the button's coordinates would presumably work and is exactly
+    the wrong tool — a screen cover swallows clicks with its own overlay, so it
+    fails in the one case it would exist for. Reach for `GET /api/debug/ax` before
+    re-deriving any of this.
 
     **A failed send retries itself** (`deliverPrompt` in `server.ts`) — the phone
     should not be handed a Retry button for what is nearly always a warm-up cost.
@@ -282,36 +320,86 @@ Two asymmetric halves — keep them separate:
     and which *cycles* (Low → Medium → High → Extra high → Max → Ultracode → wrap),
     so we press until the label matches; Plan is an `AXCheckBox` with readable
     state; the model picker is an `AXMenu` (labels carry badges — "Opus 5 NEW" —
-    so matching prefers exact then unique-prefix, and `GET …/models` enumerates it
-    live rather than hard-coding a list that would rot). **Fast has no readable
-    state and only exists for some models**, so the DB decides whether to press it
-    and a missing button is reported, not ignored. Every change is confirmed
-    against the DB before the API returns success.
+    so matching runs exact → wanted-plus-badge-words-only → unique-prefix, and a
+    tie still refuses). **The model *list* never opens that menu anymore**: it is
+    extracted from conductor-runtime's own bundled wire schema
+    (`src/modelcatalog.ts` — one literal-union of ids per agent family, classified
+    by content, never by minified names), cached keyed on the binary's identity so
+    a Conductor update invalidates it by existing. Ids become labels mechanically
+    (`opus-4-8-1m` → "Opus 4.8 1M"), the API serves both (`entries` — additive, a
+    stale PWA keeps reading `models`), and a model change resolved from the
+    catalog is confirmed against `sessions.model` *by id* — stricter than the
+    label echo. The catalog is a superset (the wire accepts entries the menu may
+    hide for a plan), so a `setModel` miss on a catalog label **invalidates the
+    catalog** and the endpoint's live fallback (`?refresh=1`, also the picker's
+    manual-refresh row and the path for `acp` chats) takes over. **Fast has no
+    readable state and only exists for some models**, so the DB decides whether to
+    press it and a missing button is reported, not ignored. Every change is
+    confirmed against the DB before the API returns success.
+
+    **Closing a menu is `AXCancel` first, Escape second** (`closeMenus`, used by
+    `listModels`, `setModel`'s no-match path and `dismissMenus`). Escape was the
+    only lever, and it is the only one an input blocker can eat — a screen cover
+    that swallows synthetic keystrokes leaves the picker open, and an open menu
+    swallows the *next* run's keystrokes. Every one of these menus advertises
+    `AXCancel`, which needs no event stream. **What you cannot do is check whether
+    it worked**: an `AXMenu` element that has been opened once *stays in the tree
+    for the life of the webview* — it survives Escape, `AXCancel` and a re-press of
+    its own trigger, keeping a real position and size and only shifting geometry.
+    So counting `AXMenu`s answers "has one ever been opened", not "is one open",
+    and a verify loop built on it fails forever: it burned every lever and
+    repeated every sweep on every call, turning a ~5s model refresh into 15-22s.
+    Hence one
+    cheap look (the count *does* drop to zero on the first close after a webview
+    load — the only evidence `AXCancel` lands), then Escape anyway, and **never a
+    re-press to "toggle it closed"**, which without a reliable read is as likely to
+    open a menu as close one. The handler returns which lever ran and the caller
+    logs it; the same reasoning is why `waitForMenuWith` identifies a menu by an
+    item it *contains* rather than by existing.
 
     **The phone doesn't push these on tap — the send does.** A tap only *stages*
     the change (`web/src/lib/agentDraft.ts`, keyed by session id and persisted
     exactly like the composer draft it belongs to), and `useSendPrompt` POSTs the
     patch *before* the prompt and drops the prompt if it didn't stick — running it
     on the model the user just moved away from is the same class of mistake as
-    landing it in the wrong workspace. That's why staged pills are coloured, why
-    staging still works with the relay down, and why flipping a value back to
-    Conductor's own clears the staged one instead of queuing a no-op round trip
-    (`clearAgentDraft` clears key by key, so a change made *during* a send stages
-    for the next one instead of being swallowed). `GET …/models` is then the only
-    tap-time trip left, and it's the expensive one — it activates Conductor and
-    opens the real menu — so its result is cached per `agent_type` and served
-    stale-while-revalidate (`web/src/lib/models.ts` ▸ `useModels`): the picker
-    paints from the last list and refreshes behind it, and a refresh that fails
-    keeps that list on screen and says so rather than emptying it.
+    landing it in the wrong workspace. The pill grammar carries the distinction:
+    **fill = the value the next prompt runs with, dashed outline = staged** —
+    solid accent is reserved for Conductor's own state, so a staged-to-on pill
+    (tinted + dashed) can't read as already-on. (The old scheme — on as subtle
+    grey, staged as the brightest accent — made a plan-default chat's pill look
+    *off*; tapping it staged plan OFF while lighting up, the exact inversion of
+    what the tap meant.) Staging still works with the relay down, flipping a value
+    back to Conductor's own clears the staged one instead of queuing a no-op round
+    trip (`clearAgentDraft` clears key by key, so a change made *during* a send
+    stages for the next one instead of being swallowed), and a staged value the DB
+    has caught up with is dropped on the sessions poll (`reconcileAgentDrafts`) —
+    drafts persist in localStorage, so without that a value changed on the Mac
+    would keep the pill "staged" forever. The picker stages model *ids* through
+    the cached id↔label map (`web/src/lib/models.ts`), which is what makes model
+    drafts reconcilable against `sessions.model` like every other key (a legacy
+    label draft never equals an id and simply persists until sent). With the
+    catalog serving the list, no tap-time trip is expensive anymore; the one
+    deliberately expensive tap left is the picker's "Refresh from Conductor" row
+    (`?refresh=1`), which opens the real menu, and a refresh that fails keeps the
+    cached list on screen and says so rather than emptying it.
 
     **Workspace status** (`setWorkspaceStatus`, `POST /api/workspaces/:id/status`)
-    is the one write that touches no pane at all — it right-clicks the workspace's
-    *sidebar row* (`AXShowMenu`), so what's on screen never changes. Conductor
-    offers this nowhere else: **the menu bar has no status command and the palette
-    has none either**, so the row menu (Mark as unread · Pin · Set status · Rename
-    · Copy link · Archive) is the only lever, and a collapsed sidebar section —
-    which hides the row from Accessibility entirely — is reported rather than
-    worked around, because there is no fallback to fall back to. Three things bite:
+    is the one write that touches no pane in the common case — it right-clicks the
+    workspace's *sidebar row* (`AXShowMenu`), so what's on screen doesn't change.
+    Conductor offers this nowhere else: **the menu bar has no status command and
+    the palette has none either**, so the row menu (Mark as unread · Pin · Set
+    status · Rename · Copy link · Archive) is the only lever. A collapsed sidebar
+    section — which hides the row from Accessibility entirely — is no longer a
+    dead end: `revealSidebarRow` escalates, cheapest first — the workspace's own
+    deep link (which *does* change the screen; failing was the alternative), then
+    pressing the section header the row should sit under (`RELAY_WS_GROUP`, the
+    label of `manual_status ?? derived_status`, tried before the other groups). A
+    header press that doesn't produce the row is undone on the spot, and
+    `restoreExpandedSections` collapses what the run opened, success or failure —
+    a phone action must not rearrange a sidebar someone deliberately folded. The
+    route also waits briefly for idle hands first (`waitForUserIdle`, fail-open):
+    contention with the human's clicks was this write's one observed failure mode.
+    Three things bite:
     the row must be **scrolled into view** (`AXScrollToVisible`) or `AXShowMenu`
     succeeds and draws nothing, which is exactly what happens right after a status
     change moves the row to a different group; the submenu opens **nested inside
@@ -330,23 +418,84 @@ Two asymmetric halves — keep them separate:
     while you are using the Mac is contention, not a bug. Uncontended it is 6/6 at
     ~11s; typing in Conductor at the same time made it look flaky.
   - `sidecar` (opt-in, `WRITE_STRATEGY=sidecar`): JSON-RPC over Conductor's unix
-    socket, addresses a session by id. Precise in principle but speaks a private
-    `-v2-` protocol — the most update-fragile surface here, and **currently
-    non-functional against Conductor 0.76**: the `query` schema drifted and idle
-    sessions aren't live in the sidecar (they need a session-resume handshake), so
-    the shipped payload fails loud (`ok:false`). Don't half-fix the schema — a
-    `type:"query"` payload *validates then silently drops* the prompt. **A live
+    socket, addresses a session by id. Re-derived against 0.81 (see src/sidecar.ts):
+    the socket verb is `query` with `{type:'query', id:<sessionId>, agentType,
+    message, prompt, options:{cwd, resume, …}}` — the shape the relay now ships;
+    the `sendUserMessageRequest` shape it used to send belongs to the child bridge
+    one layer down and never was reachable from the socket. **The socket is
+    single-client by design**: every connection (even a probe) displaces the
+    desktop app's event tunnel, and closing ours leaves the slot empty until the
+    app reattaches — events persist to an acked outbox, but live streaming stalls
+    for an unmeasured recovery window. So nothing connects casually; the one
+    scoped use is `SIDECAR_WHEN_LOCKED=1`, which lets the parked queue try one
+    sidecar delivery per text-only entry *behind the lock screen* (where
+    AppleScript is structurally dead and nobody watches the desktop), confirmed
+    against the transcript like every send — and it stays off until the
+    supervised tunnel-recovery probe (`scripts/sidecar-probe.ts`, run by a human
+    watching a streaming agent) shows the app reattaches on its own. **A live
     `query` send injects a real prompt into a running agent; never auto-run it to
-    "test."** Since `applescript` is now precise, sidecar buys nothing today.
+    "test."** Since `applescript` is precise and the tunnel hazard is real,
+    sidecar stays off the default path; the locked Mac is its one honest niche.
 
+- **"Waiting on you" is a read, not a signal** (`reads.pendingInput`). The schema
+  has no waiting flag, but a session whose transcript tail is an interactive
+  `tool_use` (`ExitPlanMode`, or `mcp__*__AskUserQuestion` — Conductor routes
+  questions through its MCP server, options as **plain strings**) with no later
+  row containing that tool_use id *is* the flag: the answer's `tool_result`
+  carries the same id, so a substring check on the id is a receipt that survives
+  any rewording of Claude Code's result text. **Deliberately no `status` gate**:
+  an interactive tool's result only ever comes from a human, so an unanswered one
+  at the tail means blocked regardless of status — and a plan actually waiting
+  sits at `needs_plan_response` and a waiting question at `needs_user_input` —
+  transient status values an `idle`-only gate filtered out (live incident
+  2026-08-17: the Approve card never showed for precisely the chats it was built
+  for). **The respond controls live in the pane header strip, not the
+  transcript** (all verified live): a waiting plan shows `AXButton
+  "Approve ⌘⇧↵"` (plus Hand off/Continue/Archive — the shortcut suffix is why
+  label matching must tolerate containment); a waiting question shows
+  ONE question at a time: `AXRadioButton`s named `"<n> <label>"` ("2 Green"), an
+  `AXTextArea "Other response"`, an **unnamed** submit button, and — multi-question
+  cards only — named nav buttons ("Previous question", "Question 2", …).
+  Selection and submission are separate controls, a radio press alone never
+  produces the receipt, submit advances to the next question, and the submit can
+  only be found by anchor: the sole *unnamed* button between the Other-response
+  box and the next splitter (`questionSubmitButton` — the named nav buttons share
+  that span). The press sequence is: jump to "Question 1", then select+submit per
+  answer, one label per question in order. `GET /api/debug/ax`
+  (reads-only, token-gated) dumps role|name|description of the visible pane —
+  with `?workspaceId=&sessionId=` it focuses the chat first — and is how these
+  shapes were discovered; reach for it before guessing at any new control. The
+  pending read rides the open chat's 1s
+  `/messages` poll as `pending` (additive — a stale PWA ignores it), which is also
+  where the phone renders the question/plan card (`web/src/components/InputRequest.tsx`,
+  a *sibling* of the entry list so the step-group fold can never bury it) and where
+  the push notifier picks its wording. Answering goes through
+  `POST /api/sessions/:id/answer` → `writes.answerSession`: the same verified
+  focus path as a send, then an AXPress on the card's own button — validated
+  against the live pending read *before* pressing (a card answered on the Mac in
+  the meantime becomes a 409 or an idempotent `already:true`, never a press into a
+  changed conversation) and confirmed against the receipt after, so the press's
+  own exit code is advisory. Two deliberate narrowings: only single-choice
+  questions are answerable from the phone — any number of them per card, one
+  label each (multiSelect renders read-only with a "answer on the Mac" hint;
+  its press sequence hasn't been seen live) — and **a locked Mac refuses
+  instead of parking** — a parked button-press firing hours later
+  would land in a conversation that moved on. On any miss,
+  `pressAnswerOption`/`pressApprovePlan` fail with every pressable name they
+  *did* see — the failure is the discovery dump — and `answerSession` retries
+  once through a full refocus, because the one observed failure mode is the
+  human switching panes mid-scan.
 - **Notifications are a read that pushes** — the cheap third shape, on the durable
   side of the split. `src/notify.ts` polls the same read-only SQLite for
   `sessions.status` transitions and POSTs a Web Push message; no Conductor
-  process, no AX, no window. **`working → idle` is the whole trigger** — it is
-  what "done", "asked you a question" and "waiting on a permission prompt" all
-  look like, because each ends the turn — plus `→ error`. Don't hunt for a
-  finer-grained signal: the schema has no permission-request table (checked), and
-  `status` only ever holds `working`/`idle`/`error`. Two invariants keep it from
+  process, no AX, no window. **A turn ending is the whole trigger** (`working →`
+  any of `idle`/`needs_plan_response`/`needs_user_input` — see `turnEnded`) —
+  "done", "plan ready", "asked a question" and "waiting on a permission prompt"
+  all look like one, plus `→ error`. Don't hunt for a finer-grained signal: the
+  schema has no permission-request table (checked), and `status` holds exactly
+  those five values — **beware that a status can be transient**:
+  `needs_plan_response` and `needs_user_input` exist only while their wait does,
+  so a "verified" survey of stored values missed both for months. Two invariants keep it from
   being a nuisance: a transition must **survive one more tick** before it fires
   (a queued prompt restarting the turn would otherwise buzz for nothing), and the
   first tick after a device subscribes is a **baseline, not a broadcast** (else
@@ -469,6 +618,11 @@ bind trap below), not by unit test.
   nothing. Keep logic *outside* the tell and reach in via one-line helpers
   (`tabLabel`, `paneLabels`), or name variables `strip`/`pane`. Nothing else in
   the toolchain reads this language, so run `yarn verify` after every edit.
+  **Some names are AppleScript's own and bite outside a tell too**: `named` and
+  `line` are reference forms, so `set named to {}` / `set line to …` fail to
+  compile at all ("Expected expression but found property or key form", and the
+  reported line number points at whatever came before) — `yarn verify` catches
+  these, which is most of why it exists.
   - **It is a real file, and that is load-bearing in two directions.** `writes.ts`
     reads it as a sibling of its own module (`import.meta.dirname`, the one place
     that may — see the `packageRoot()` rule below), so `yarn build:node` has to

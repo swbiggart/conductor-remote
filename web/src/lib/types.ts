@@ -145,9 +145,19 @@ export interface AgentResult {
 	error?: string
 }
 
+/** One model the picker can offer: the DB id to stage, the menu label to show. */
+export interface ModelEntry {
+	id: string
+	label: string
+}
+
 export interface ModelsResult {
 	ok: boolean
 	models?: string[]
+	/** id+label pairs from the relay's catalog; absent from a live menu read or an older relay. */
+	entries?: ModelEntry[]
+	/** 'catalog' (extracted from Conductor's binary, instant) or 'live' (the real menu was opened). */
+	source?: string
 	error?: string
 }
 
@@ -190,13 +200,53 @@ export interface TranscriptEntry {
 	detail?: string
 	/** True when this row is a failed tool result. */
 	error?: boolean
+	/** tool_use id, set only for interactive tools (mirrors src/transcript.ts). */
+	toolUseId?: string
+	questions?: PendingQuestion[]
+	plan?: string
 	ts: string
 	queued: boolean
+	/** Files the user attached on the Mac — rendered as chips under the bubble. */
+	attachments?: { name: string; path: string }[]
+	/** Conductor's turn id — groups a turn's entries for the end-of-turn summary. */
+	turnId?: string
+	/** Line counts for a file-editing tool call, plus the clipped hunk behind the chip. */
+	adds?: number
+	dels?: number
+	hunk?: string
+	/** A Task/Agent tool_use's own id — the id its sub-agent's entries reference. */
+	agentId?: string
+	/** Set on every entry a sub-agent emitted: the spawning Task's id. */
+	parentToolUseId?: string
+}
+
+export interface QuestionOption {
+	label: string
+	description?: string
+}
+
+export interface PendingQuestion {
+	question: string
+	header?: string
+	multiSelect?: boolean
+	options: QuestionOption[]
+}
+
+/** A question or plan the agent is stopped on (mirrors PendingInput in src/reads.ts). */
+export interface PendingInput {
+	kind: 'question' | 'plan'
+	toolUseId: string
+	rowid: number
+	questions?: PendingQuestion[]
+	plan?: string
+	ts: string
 }
 
 export interface MessagesResponse {
 	entries: TranscriptEntry[]
 	cursor: number
+	/** Absent from relays older than this field — treat as "nothing pending". */
+	pending?: PendingInput | null
 }
 
 export interface DiffFile {

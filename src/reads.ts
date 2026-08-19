@@ -5,7 +5,7 @@ import type { ConductorDb } from './db.ts'
 import type { FirstPrompt } from './firstprompt.ts'
 import { describeRepoIcon, type RepoIcon, type ResolvedIcon, resolveRepoIcon } from './icons.ts'
 import type { ParkedPrompt } from './parked.ts'
-import { parseMessage, type TranscriptEntry } from './transcript.ts'
+import { type PendingQuestion, parseMessage, type TranscriptEntry } from './transcript.ts'
 
 export interface WorkspaceRow {
 	id: string
@@ -79,6 +79,17 @@ export interface SessionRow {
 
 /** GitHub PR state of a workspace's branch, attached best-effort by src/pr.ts. */
 export type PrStatus = 'merged' | 'draft' | 'conflicts' | 'mergeable'
+
+/** A question or plan the agent is stopped on, derived from the transcript tail (see `pendingInput`). */
+export interface PendingInput {
+	kind: 'question' | 'plan'
+	toolUseId: string
+	/** rowid of the tool_use row — stable identity for the card and the answer validation. */
+	rowid: number
+	questions?: PendingQuestion[]
+	plan?: string
+	ts: string
+}
 
 /** One chat's live status, with enough context to name it in a notification (see src/notify.ts). */
 export interface SessionState {
@@ -376,8 +387,85 @@ export class Reads {
 		return null
 	}
 
+	/**
+	 * Is this chat stopped on a question or a plan waiting for the user? Derived
+	 * entirely from the transcript tail — a session whose newest meaningful entry is
+	 * an interactive tool_use with no tool_result carrying the same id *is* the
+	 * flag. Deliberately no `sessions.status` gate: an interactive tool's result can
+	 * only come from a human, so an unanswered one at the tail means the agent is
+	 * blocked no matter what status says — and status lies here anyway. A plan
+	 * awaiting approval sits at `needs_plan_response`, a fourth value the schema
+	 * surveys never saw because it exists only while a plan is actually waiting;
+	 * the `=== 'idle'` gate this replaces returned null for exactly the sessions
+	 * the card was built for (live-observed 2026-08-17). The supersede scan below
+	 * plus the receipt check are what keep mid-turn rows out. Riding the per-chat
+	 * messages poll (1s, open chat only), so the tail scan stays cheap.
+	 */
+	pendingInput(sessionId: string): PendingInput | null {
+		const rows = this.db.query<{
+			rowid: number
+			id: string
+			role: string | null
+			content: string | null
+			full_message: string | null
+			created_at: string
+			sent_at: string | null
+			queue_order: number | null
+		}>(
+			`SELECT rowid, id, role, content, full_message, created_at, sent_at, queue_order
+			 FROM session_messages
+			 WHERE session_id = ?
+			 ORDER BY rowid DESC
+			 LIMIT 30`,
+			[sessionId]
+		)
+		// Newest first: the first meaningful entry decides. A question buried under 30+
+		// bookkeeping rows fails closed to "nothing pending" — no card beats a stale card.
+		for (const row of rows) {
+			const entries = parseMessage(row, null)
+			for (let i = entries.length - 1; i >= 0; i--) {
+				const e = entries[i]
+				if (e.toolUseId && (e.tool === 'AskUserQuestion' || e.tool === 'ExitPlanMode')) {
+					if (this.answerRecorded(sessionId, e.toolUseId, row.rowid)) return null
+					return {
+						kind: e.tool === 'ExitPlanMode' ? 'plan' : 'question',
+						toolUseId: e.toolUseId,
+						rowid: row.rowid,
+						questions: e.questions,
+						plan: e.plan,
+						ts: e.ts
+					}
+				}
+				// Anything the user or agent did after a question supersedes it — including a
+				// failed tool_result, which is what a rejected plan leaves behind.
+				if (e.role === 'user' || e.role === 'assistant' || e.role === 'tool') return null
+			}
+		}
+		return null
+	}
+
+	/**
+	 * Has anything referencing this tool_use id landed after the question row? The
+	 * answer's tool_result frame carries the same id, so a plain substring check is
+	 * the drift-proof receipt — no dependence on Claude Code's result wording.
+	 */
+	answerRecorded(sessionId: string, toolUseId: string, sinceRowid: number): boolean {
+		const rows = this.db.query<{ found: number }>(
+			`SELECT 1 AS found FROM session_messages
+			 WHERE session_id = ? AND rowid > ? AND content LIKE '%' || ? || '%'
+			 LIMIT 1`,
+			[sessionId, sinceRowid, toolUseId]
+		)
+		return rows.length > 0
+	}
+
 	/** Session → worktree path, cached: it's stable for a session's lifetime and polled every tick. */
 	private readonly worktreeBySession = new Map<string, string | null>()
+
+	/** The session's worktree on disk — the base transcript-referenced relative paths resolve against. */
+	worktreeFor(sessionId: string): string | null {
+		return this.sessionWorktree(sessionId)
+	}
 
 	private sessionWorktree(sessionId: string): string | null {
 		const cached = this.worktreeBySession.get(sessionId)
@@ -414,8 +502,9 @@ export class Reads {
 			created_at: string
 			sent_at: string | null
 			queue_order: number | null
+			turn_id: string | null
 		}>(
-			`SELECT rowid, id, role, content, full_message, created_at, sent_at, queue_order
+			`SELECT rowid, id, role, content, full_message, created_at, sent_at, queue_order, turn_id
 			 FROM session_messages
 			 WHERE session_id = ? AND rowid > ?
 			 ORDER BY rowid ASC`,

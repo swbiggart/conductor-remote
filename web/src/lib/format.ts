@@ -84,7 +84,9 @@ export function workspaceStatus(w: Workspace): string {
 }
 
 /** Group order matches the desktop sidebar (Done → In review → In progress → Setting up → Backlog). */
-export const STATUS_ORDER = ['done', 'in-review', 'in-progress', 'setting-up', 'backlog', 'canceled']
+// Active work first (setting-up is a brand-new workspace, seconds from
+// in-progress), finished work last. Mirrored by Format.swift ▸ statusOrder.
+export const STATUS_ORDER = ['setting-up', 'in-progress', 'in-review', 'backlog', 'done', 'canceled']
 
 /**
  * The statuses you can *set*, in the order Conductor's own "Set status" menu lists

@@ -9,13 +9,17 @@
  * rename every UI string and notifications keep working.
  *
  * What counts as news is deliberately narrow — `sessions.status` is the only
- * signal Conductor records, and it holds exactly three values:
- * - `working → idle` — the turn ended. This is *the* event: it covers "done",
- *   "asked you a question" and "hit a permission prompt" alike, because all
- *   three end the turn.
+ * signal Conductor records, and it holds four values (`working`, `idle`,
+ * `error`, and the transient `needs_plan_response` — see `turnEnded`):
+ * - `working → idle | needs_plan_response` — the turn ended. This is *the*
+ *   event: it covers "done", "asked you a question", "plan ready" and "hit a
+ *   permission prompt" alike, because each ends the turn.
  * - `→ error` — the agent stopped badly.
  * There is no permission-request table to watch (verified against the schema), so
- * don't go looking for a finer-grained trigger; there isn't one.
+ * don't go looking for a finer-grained *trigger*; there isn't one. The *wording* is
+ * allowed one refinement: at fire time, `reads.pendingInput` (the transcript-tail
+ * read) can say the turn ended on a question or a plan — one extra tail query per
+ * notification, never per tick.
  *
  * Two properties worth keeping:
  * - **Transitions are confirmed one tick before they fire.** A status that
@@ -283,6 +287,15 @@ function oneLine(text: string): string {
 
 // --- the watcher ---
 
+/**
+ * Statuses that mean "the turn ended and the agent is waiting". `idle` is the
+ * common one; `needs_plan_response` (plan awaiting approval) and
+ * `needs_user_input` (question awaiting an answer) are transient — they exist
+ * only during the wait, which is how they hid from every schema survey and why
+ * these turn endings used to be exactly the ones that never notified.
+ */
+const turnEnded = (s: string | null): boolean => s === 'idle' || s === 'needs_plan_response' || s === 'needs_user_input'
+
 /** Last seen status per session. Null means "re-baseline on the next tick" (nobody was subscribed). */
 let previous: Map<string, string | null> | null = null
 /** Transitions seen once and awaiting a second tick's confirmation. */
@@ -310,7 +323,7 @@ function tick(reads: Reads): void {
 		if (pendingKind) {
 			armed.delete(state.sessionId)
 			// Confirmed only if the new status held for a second tick; a flap just drops the arm.
-			if ((pendingKind === 'done' && now === 'idle') || (pendingKind === 'error' && now === 'error')) {
+			if ((pendingKind === 'done' && turnEnded(now)) || (pendingKind === 'error' && now === 'error')) {
 				void fire(reads, state.sessionId, pendingKind, state)
 			}
 			continue
@@ -318,7 +331,7 @@ function tick(reads: Reads): void {
 		// A session we've never seen (a new chat, or the first tick after re-baselining)
 		// contributes its status to the snapshot but is never itself news.
 		if (before === undefined) continue
-		if (before === 'working' && now === 'idle') armed.set(state.sessionId, 'done')
+		if (before === 'working' && turnEnded(now)) armed.set(state.sessionId, 'done')
 		else if (before !== 'error' && now === 'error') armed.set(state.sessionId, 'error')
 	}
 	// A session armed on the last tick can vanish before this one (its workspace was
@@ -336,14 +349,21 @@ async function fire(
 ): Promise<void> {
 	const said = reads.lastAssistantText(sessionId)
 	const where = state.sessionTitle ? `${state.workspaceTitle} · ${state.sessionTitle}` : state.workspaceTitle
+	// working→idle is still the only trigger, but the transcript tail can say *why* the
+	// turn ended: one extra tail read per notification (not per tick), never per session.
+	const waiting = kind === 'done' ? reads.pendingInput(sessionId) : null
 	const body =
 		kind === 'error'
 			? said
 				? `Stopped with an error. ${oneLine(said)}`
 				: 'The agent stopped with an error.'
-			: said
-				? oneLine(said)
-				: 'Finished its turn.'
+			: waiting?.kind === 'question'
+				? oneLine(waiting.questions?.[0]?.question ?? 'Asked you a question.')
+				: waiting?.kind === 'plan'
+					? 'Plan ready for review.'
+					: said
+						? oneLine(said)
+						: 'Finished its turn.'
 	const sent = await notifyAll({
 		title: state.repoName ? `${where} — ${state.repoName}` : where,
 		body,
